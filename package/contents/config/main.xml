@@ -15,7 +15,7 @@
             <default>true</default>
         </entry>
         <entry name="ringSize" type="Int">
-            <default>18</default>
+            <default>22</default>
         </entry>
     </group>
 </kcfg>

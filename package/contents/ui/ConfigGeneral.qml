@@ -41,7 +41,7 @@ Kirigami.FormLayout {
     QQC2.SpinBox {
         id: sizeSpin
         Kirigami.FormData.label: "Ring size (px):"
-        from: 12
-        to: 28
+        from: 14
+        to: 34
     }
 }

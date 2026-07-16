@@ -10,8 +10,8 @@ Item {
     property real percent: 0            // 0..100
     property string severity: "ok"      // ok | warn | crit
     property string provider: "claude"  // brand hue key
-    property int ringSize: 18
-    property int lineWidth: 3
+    property int ringSize: 22
+    property int lineWidth: Math.max(3, Math.round(ringSize / 4.5))
 
     implicitWidth: ringSize
     implicitHeight: ringSize
