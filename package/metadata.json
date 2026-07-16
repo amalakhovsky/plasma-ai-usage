@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "org.kde.plasma.aiusage",
+        "Name": "AI Usage",
+        "Description": "Claude Code and Codex usage quotas as compact panel rings",
+        "Icon": "speedometer",
+        "Category": "System Information",
+        "Authors": [
+            { "Name": "Andrey Malakhovsky" }
+        ],
+        "License": "GPL-3.0-or-later",
+        "Version": "0.1.0",
+        "Website": "https://github.com/amalakhovsky/plasma-ai-usage",
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

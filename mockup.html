@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>AI Usage — ring mockup</title>
+<style>
+  body { background:#1e1e2e; color:#cdd6f4; font:14px/1.4 system-ui, sans-serif;
+         display:flex; gap:2rem; align-items:center; justify-content:center; height:100vh; margin:0; }
+  .chip { display:flex; align-items:center; gap:.4rem; }
+  svg { transform: rotate(-90deg); }
+  .track { stroke: rgba(205,214,244,.22); fill:none; }
+  .val   { fill:none; stroke-linecap:round; }
+  .note { position:fixed; bottom:1rem; width:100%; text-align:center; opacity:.6; }
+</style>
+<!-- Preview of the two panel rings: Claude (warm) + Codex (teal), brand hue that
+     shifts to amber/red as the window fills. The real widget draws these with QML Canvas. -->
+<div class="chip">
+  <svg width="22" height="22"><circle class="track" cx="11" cy="11" r="9" stroke-width="3"/>
+    <circle class="val" cx="11" cy="11" r="9" stroke-width="3" stroke="#d97757"
+      stroke-dasharray="56.5" stroke-dashoffset="45.2"/></svg><span>Claude 20%</span>
+</div>
+<div class="chip">
+  <svg width="22" height="22"><circle class="track" cx="11" cy="11" r="9" stroke-width="3"/>
+    <circle class="val" cx="11" cy="11" r="9" stroke-width="3" stroke="#ff7800"
+      stroke-dasharray="56.5" stroke-dashoffset="17"/></svg><span>Codex 70%</span>
+</div>
+<div class="chip">
+  <svg width="22" height="22"><circle class="track" cx="11" cy="11" r="9" stroke-width="3"/>
+    <circle class="val" cx="11" cy="11" r="9" stroke-width="3" stroke="#e01b24"
+      stroke-dasharray="56.5" stroke-dashoffset="3"/></svg><span>95% — critical</span>
+</div>
+<div class="note">Claude warm · Codex teal · amber at ~75% · red at ~90% (brand hue + severity)</div>
