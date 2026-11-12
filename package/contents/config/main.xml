@@ -6,7 +6,7 @@
     <kcfgfile name=""/>
     <group name="General">
         <entry name="pollSeconds" type="Int">
-            <default>120</default>
+            <default>300</default>
         </entry>
         <entry name="panelWindow" type="String">
             <default>shortest</default>
@@ -16,6 +16,20 @@
         </entry>
         <entry name="ringSize" type="Int">
             <default>22</default>
+        </entry>
+        <!-- OpenRouter: prepaid balance floors (USD) that turn the ring amber / red -->
+        <entry name="orWarnUsd" type="Double">
+            <default>10</default>
+        </entry>
+        <entry name="orCritUsd" type="Double">
+            <default>3</default>
+        </entry>
+        <!-- What the label next to the OpenRouter ring shows: "dollars" (balance left) or "percent" (of key cap) -->
+        <entry name="orLabel" type="String">
+            <default>dollars</default>
+        </entry>
+        <entry name="orNotify" type="Bool">
+            <default>true</default>
         </entry>
     </group>
 </kcfg>

@@ -1,10 +1,11 @@
 # AI Usage — KDE Plasma widget
 
 A compact Plasma 6 panel widget that shows your **Claude Code** and **Codex** usage
-quotas as two rings — one per provider — with a detailed pop-up. It reads the same
-local credentials the `claude` and `codex` CLIs already use, so there's no extra
-login, and it auto-detects which providers are present (a ring only appears when
-that provider is signed in).
+quotas as rings — one per provider — with a detailed pop-up, plus an optional
+**OpenRouter** ring for API credit. It reads the same local credentials the
+`claude` and `codex` CLIs already use, so there's no extra login, and it
+auto-detects which providers are present (a ring only appears when that provider
+is set up).
 
 The KDE counterpart to the GNOME
 [ClaudeCodeUsage](https://github.com/amalakhovsky/ClaudeCodeUsage) extension.
@@ -20,7 +21,11 @@ The KDE counterpart to the GNOME
   providers change their windows.
 - **Refresh + write-back** of both OAuth tokens when they're near expiry, in place,
   0600, atomically — it rides on the CLIs' credentials without fighting them.
-- **Auto-detect**: no Claude creds → no Claude ring; same for Codex.
+- **Auto-detect**: no Claude creds → no Claude ring; same for Codex and OpenRouter.
+- **OpenRouter ring** (optional): how much of the key's spending cap is used,
+  labelled with the dollars left on the account (or the percentage). The ring turns
+  amber/red when the prepaid balance drops below thresholds you set, and can send a
+  desktop notification when it crosses one.
 
 ## Privacy
 
@@ -28,15 +33,17 @@ Everything runs locally. The widget reads:
 
 - `~/.claude/.credentials.json` (Claude Code's OAuth tokens)
 - `~/.codex/auth.json` (Codex's OAuth tokens)
+- `~/.config/ai-usage/openrouter.key` (only if you add one; see below)
 
-Your tokens never leave the machine except in the two API calls the CLIs make
-anyway — `api.anthropic.com` and `chatgpt.com`. Nothing is sent anywhere else.
+Your tokens never leave the machine except in the API calls the CLIs make
+anyway — `api.anthropic.com` and `chatgpt.com` — and, if configured,
+`openrouter.ai`. Nothing is sent anywhere else.
 
 ## Requirements
 
 - KDE Plasma 6
 - `python3` (standard library only — no pip installs)
-- Signed in with the `claude` and/or `codex` CLI
+- Signed in with the `claude` and/or `codex` CLI, and/or an OpenRouter API key
 
 ## Install
 
@@ -49,14 +56,33 @@ cd plasma-ai-usage
 Then right-click your panel → **Add Widgets…** → **AI Usage**, and drag it in.
 To update after `git pull`, run `./install.sh` again.
 
+## OpenRouter
+
+Put your OpenRouter API key on a single line in `~/.config/ai-usage/openrouter.key`
+and make it readable only by you:
+
+```sh
+mkdir -p ~/.config/ai-usage && chmod 700 ~/.config/ai-usage
+printf '%s\n' 'sk-or-...' > ~/.config/ai-usage/openrouter.key
+chmod 600 ~/.config/ai-usage/openrouter.key
+```
+
+(`$OPENROUTER_KEY_FILE` overrides the path.) The ring appears on the next refresh.
+It uses two read-only calls, `/api/v1/credits` (balance) and `/api/v1/auth/key`
+(the key's limit and when it resets). If the key has a spending cap (daily, weekly
+or monthly), the ring shows how much of it is used; if not, how much of the credit
+you have bought is used up.
+
 ## Configuration
 
 Right-click the widget → **Configure**:
 
-- **Refresh interval** (default 120 s)
+- **Refresh interval** (default 300 s)
 - **Panel ring shows** — shortest window (default), weekly, or most-used
 - **Show percentage** next to each ring
 - **Ring size**
+- **OpenRouter**: warning and critical balance in dollars (default $10 / $3),
+  label (dollars left or percent of cap), and notifications on/off
 
 ## How it works
 

@@ -20,8 +20,14 @@ PlasmoidItem {
     readonly property string helperPath:
         Qt.resolvedUrl("../tools/aiusage.py").toString().replace("file://", "")
     readonly property string helperCmd: "python3 '" + helperPath + "'"
+        + " --or-floors " + Number(Plasmoid.configuration.orWarnUsd) + "," + Number(Plasmoid.configuration.orCritUsd)
+        + (Plasmoid.configuration.orNotify ? "" : " --no-notify")
+    readonly property var providerNames: ["claude", "codex", "openrouter"]
+    readonly property string orLabel: Plasmoid.configuration.orLabel || "dollars"
 
-    readonly property int pollSeconds: Plasmoid.configuration.pollSeconds || 120
+    // 5 min default: the usage endpoints 429 easily and the helper caches +
+    // backs off on its own, so polling faster buys nothing.
+    readonly property int pollSeconds: Math.max(60, Plasmoid.configuration.pollSeconds || 300)
     readonly property string panelMode: Plasmoid.configuration.panelWindow || "shortest"
     readonly property bool showPercent: Plasmoid.configuration.showPercent
     readonly property int ringSize: Plasmoid.configuration.ringSize || 22
@@ -33,8 +39,20 @@ PlasmoidItem {
         if (!provAvailable(name)) return null;
         return Theme.panelWindow(usage[name].windows, panelMode);
     }
+    function provStale(name) {
+        return provAvailable(name) && !!usage[name].stale;
+    }
+    function provError(name) {
+        return provAvailable(name) ? (usage[name].error || "") : "";
+    }
     function titleFor(name) {
+        if (name === "openrouter") return "OpenRouter";
         return name.charAt(0).toUpperCase() + name.slice(1);
+    }
+    function anyAvailable() {
+        for (var i = 0; i < providerNames.length; i++)
+            if (provAvailable(providerNames[i])) return true;
+        return false;
     }
     // Click a ring: open that provider's popup, or close it if it's already the
     // one showing.
@@ -65,13 +83,15 @@ PlasmoidItem {
                 root.loadError = (data["stderr"] || "helper failed").trim();
             }
         }
-        function poll() { exec.connectSource(root.helperCmd); }
+        // --force bypasses the helper's minimum-interval throttle (not its
+        // 429 backoff), for the popup's Refresh button.
+        function poll(force) { exec.connectSource(root.helperCmd + (force ? " --force" : "")); }
     }
 
     function refresh(force) {
         if (!force && Date.now() - lastFetch < 60000) return;
         lastFetch = Date.now();
-        exec.poll();
+        exec.poll(!!force);
     }
 
     Timer {
@@ -90,15 +110,27 @@ PlasmoidItem {
         onTriggered: root.lastUpdated = root.lastUpdated
     }
 
-    Plasmoid.status: (provAvailable("claude") || provAvailable("codex"))
-        ? PlasmaCore.Types.ActiveStatus : PlasmaCore.Types.PassiveStatus
+    // Always active: the panel must never collapse the widget just because a
+    // fetch failed or a provider is temporarily unavailable.
+    Plasmoid.status: PlasmaCore.Types.ActiveStatus
 
     toolTipMainText: "AI usage"
     toolTipSubText: {
         if (!usage) return "Loading…";
         var parts = [];
-        var c = provWindow("claude"); if (c) parts.push("Claude " + Math.round(c.percent) + "%");
-        var x = provWindow("codex");  if (x) parts.push("Codex " + Math.round(x.percent) + "%");
+        var names = providerNames;
+        for (var i = 0; i < names.length; i++) {
+            var n = names[i];
+            if (!provAvailable(n)) continue;
+            var w = provWindow(n);
+            var s = titleFor(n) + " " + (w ? Math.round(w.percent) + "%" : "—");
+            if (n === "openrouter" && usage[n].balance !== undefined && usage[n].balance !== null)
+                s = titleFor(n) + " $" + usage[n].balance.toFixed(2) + " left" + (w ? ", cap " + Math.round(w.percent) + "%" : "");
+            if (provError(n)) s += " (" + provError(n) + (w ? ", showing cached" : "") + ")";
+            var sp = usage[n].spend;
+            if (sp && sp.limitReached) s += " · credits: limit reached";
+            parts.push(s);
+        }
         return parts.length ? parts.join("   ·   ") : "No providers detected";
     }
 
@@ -108,6 +140,8 @@ PlasmoidItem {
         property string provider: "claude"
         property var win: root.provWindow(provider)
         property var prov: root.usage ? root.usage[provider] : null
+        property bool hasError: !!(prov && prov.error)
+        property bool stale: root.provStale(provider)
 
         visible: root.provAvailable(provider)
         implicitWidth: chipRow.implicitWidth
@@ -121,7 +155,9 @@ PlasmoidItem {
             id: chipRow
             anchors.centerIn: parent
             spacing: 4
-            opacity: chip.containsMouse ? 0.8 : 1.0
+            // Cached/stale numbers render dimmed so a stuck fetch is visible
+            // without hiding the last known values.
+            opacity: (chip.containsMouse ? 0.8 : 1.0) * (chip.stale && chip.win ? 0.55 : 1.0)
 
             Ring {
                 provider: chip.provider
@@ -130,13 +166,24 @@ PlasmoidItem {
                 Layout.preferredHeight: root.ringSize
                 Layout.alignment: Qt.AlignVCenter
                 percent: chip.win ? chip.win.percent : 0
-                severity: (chip.prov && chip.prov.error) ? "crit"
-                          : (chip.win ? chip.win.severity : "ok")
+                severity: chip.win ? chip.win.severity : (chip.hasError ? "crit" : "ok")
+                error: chip.hasError && !chip.win
             }
             PlasmaComponents.Label {
-                visible: root.showPercent && chip.win
-                text: (chip.prov && chip.prov.error) ? "!" : (chip.win ? Math.round(chip.win.percent) + "%" : "")
+                // Stay visible whenever the provider exists: a failed fetch with
+                // no cached data shows "!" instead of vanishing.
+                visible: root.showPercent
+                text: {
+                    if (chip.provider === "openrouter" && root.orLabel === "dollars"
+                            && chip.prov && chip.prov.balance !== undefined && chip.prov.balance !== null) {
+                        var b = chip.prov.balance;
+                        return "$" + (b < 10 ? b.toFixed(2) : Math.round(b));
+                    }
+                    return chip.win ? Math.round(chip.win.percent) + "%" : (chip.hasError ? "!" : "—");
+                }
                 font.bold: true
+                color: (chip.hasError && !chip.win) ? Kirigami.Theme.negativeTextColor
+                                                    : Kirigami.Theme.textColor
                 Layout.alignment: Qt.AlignVCenter
             }
         }
@@ -148,8 +195,9 @@ PlasmoidItem {
         Layout.minimumWidth: implicitWidth
         ProviderChip { provider: "claude" }
         ProviderChip { provider: "codex" }
+        ProviderChip { provider: "openrouter" }
         MouseArea {
-            visible: !root.provAvailable("claude") && !root.provAvailable("codex")
+            visible: !root.anyAvailable()
             implicitWidth: fallback.implicitWidth
             implicitHeight: fallback.implicitHeight
             onClicked: root.expanded = !root.expanded
@@ -186,8 +234,14 @@ PlasmoidItem {
         }
 
         PlasmaComponents.Label {
-            visible: popup.prov && popup.prov.error
-            text: popup.prov ? (popup.prov.error || "") : ""
+            visible: !!(popup.prov && popup.prov.error)
+            text: {
+                if (!popup.prov || !popup.prov.error) return "";
+                var t = popup.prov.error;
+                if (popup.prov.stale && popup.prov.fetchedAt)
+                    t += "\nShowing cached data from " + Qt.formatTime(new Date(popup.prov.fetchedAt * 1000));
+                return t;
+            }
             color: Kirigami.Theme.negativeTextColor
             font.pointSize: Kirigami.Theme.smallFont.pointSize
             Layout.fillWidth: true
@@ -213,10 +267,33 @@ PlasmoidItem {
             Layout.fillWidth: true
             provider: root.selectedProvider
             label: (popup.prov && popup.prov.spend)
-                ? "Credits  " + (popup.prov.spend.currency || "") + " " + popup.prov.spend.used + " / " + popup.prov.spend.limit
+                ? "Credits  " + (popup.prov.spend.currency || "") + " "
+                  + (popup.prov.spend.used || "—") + " / " + (popup.prov.spend.limit || "—")
+                  + (popup.prov.spend.status ? "  · " + popup.prov.spend.status : "")
                 : "Credits"
             percent: (popup.prov && popup.prov.spend) ? popup.prov.spend.percent : 0
             severity: (popup.prov && popup.prov.spend) ? popup.prov.spend.severity : "ok"
+        }
+
+        PlasmaComponents.Label {
+            visible: popup.sp === "openrouter" && !!(popup.prov && popup.prov.balance !== undefined && popup.prov.balance !== null)
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            text: {
+                if (!popup.prov || popup.prov.balance === undefined || popup.prov.balance === null) return "";
+                var f = popup.prov.floors || {};
+                var sev = popup.prov.balanceSeverity || "ok";
+                var t = "Balance $" + popup.prov.balance.toFixed(2);
+                if (sev === "crit") t += "  · below $" + f.crit + " floor, top up";
+                else if (sev === "warn") t += "  · below $" + f.warn + " floor";
+                else if (f.warn !== undefined) t += "  · amber under $" + f.warn + ", red under $" + f.crit;
+                return t;
+            }
+            color: (popup.prov && popup.prov.balanceSeverity === "crit") ? Kirigami.Theme.negativeTextColor
+                 : (popup.prov && popup.prov.balanceSeverity === "warn") ? Kirigami.Theme.neutralTextColor
+                 : Kirigami.Theme.textColor
+            font.pointSize: Kirigami.Theme.smallFont.pointSize
+            font.bold: !!(popup.prov && popup.prov.balanceSeverity !== "ok")
         }
 
         PlasmaComponents.Label {
@@ -224,7 +301,7 @@ PlasmoidItem {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
             text: root.loadError.length ? root.loadError
-                : "No credentials found.\nSign in with the claude or codex CLI."
+                : "No credentials found.\nSign in with the claude or codex CLI,\nor put an OpenRouter key in ~/.config/ai-usage/openrouter.key."
             opacity: 0.8
         }
 
@@ -236,9 +313,12 @@ PlasmoidItem {
                 Layout.fillWidth: true
                 opacity: 0.6
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
-                text: root.lastUpdated
-                    ? "Updated " + Qt.formatTime(new Date(root.lastUpdated))
-                    : "Loading…"
+                text: {
+                    if (popup.prov && popup.prov.fetchedAt)
+                        return "Data from " + Qt.formatTime(new Date(popup.prov.fetchedAt * 1000))
+                            + (popup.prov.source === "quota.sh" ? " (via crew)" : "");
+                    return root.lastUpdated ? "Updated " + Qt.formatTime(new Date(root.lastUpdated)) : "Loading…";
+                }
             }
             PlasmaComponents.Button {
                 text: "Refresh"

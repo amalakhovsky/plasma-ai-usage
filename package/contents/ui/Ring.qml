@@ -10,6 +10,7 @@ Item {
     property real percent: 0            // 0..100
     property string severity: "ok"      // ok | warn | crit
     property string provider: "claude"  // brand hue key
+    property bool error: false          // no data at all: tint the track red
     property int ringSize: 22
     property int lineWidth: Math.max(3, Math.round(ringSize / 4.5))
 
@@ -19,6 +20,7 @@ Item {
     onPercentChanged: canvas.requestPaint()
     onSeverityChanged: canvas.requestPaint()
     onProviderChanged: canvas.requestPaint()
+    onErrorChanged: canvas.requestPaint()
 
     Canvas {
         id: canvas
@@ -34,9 +36,10 @@ Item {
             ctx.lineWidth = root.lineWidth;
             ctx.lineCap = "round";
 
-            // track
-            var tc = Kirigami.Theme.textColor;
-            ctx.strokeStyle = Qt.rgba(tc.r, tc.g, tc.b, 0.22);
+            // track (red-tinted when there is nothing to show, so an empty
+            // ring still reads as "something is wrong" rather than vanishing)
+            var tc = root.error ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor;
+            ctx.strokeStyle = Qt.rgba(tc.r, tc.g, tc.b, root.error ? 0.6 : 0.22);
             ctx.beginPath();
             ctx.arc(cx, cy, r, 0, 2 * Math.PI);
             ctx.stroke();
