@@ -7,6 +7,8 @@ quotas as rings — one per provider — with a detailed pop-up, plus an optiona
 auto-detects which providers are present (a ring only appears when that provider
 is set up).
 
+![Claude, Codex and OpenRouter rings in the panel](screenshots/panel.png)
+
 The KDE counterpart to the GNOME
 [ClaudeCodeUsage](https://github.com/amalakhovsky/ClaudeCodeUsage) extension.
 
