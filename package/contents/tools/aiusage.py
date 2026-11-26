@@ -53,18 +53,28 @@ run from the widget, a systemd timer and on-demand callers at once.
     machine consumers. outcome is one of fetched|cache|stale|rate-limited|
     error|busy|unavailable.
   * A 2xx response with zero usage windows is an error, never cached.
+  * Windows with a null/missing utilization are skipped, never shown as 0%.
+  * --status-file writes are serialized under <PATH>.lock and merged per
+    provider (an older fetchedAt never replaces a newer one); exit status is 1
+    if the file can't be written. Unreadable/corrupt credentials are an error
+    (cached data served stale), not "unavailable".
+  * Token-endpoint 429 feeds the provider's 429 hold; only 400/401/403 mean
+    "session expired". A token rotated on disk mid-refresh is adopted.
   * OAuth: the existing access token is used until it is within 30 s of expiry
     (or the API answers 401), then the creds file is re-read (a live CLI may
     have rotated it) before refreshing, and only token fields are merged back.
 
 Stdlib only, so it runs anywhere python3 does.
 """
+import argparse
 import base64
 import fcntl
 import json
+import math
 import os
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -123,18 +133,56 @@ def _read_json(path):
         return None
 
 
+def _read_json_strict(path, retries=3):
+    """Parsed JSON, or None when the file does not exist. Any other failure
+    (unreadable, truncated/corrupt after a few short retries) raises, so a
+    broken credentials file is never mistaken for a missing one."""
+    for attempt in range(retries):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError:
+            # a CLI may be mid-write (non-atomic); give it a moment
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.05)
+
+
 def _write_json_atomic(path, data):
     """Owner-only (0600) atomic write, so a token refresh never leaves a
-    half-written creds file and never widens the file's permissions."""
-    tmp = f"{path}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    half-written creds file and never widens the file's permissions. Writes
+    through symlinks (to the real file) and uses an exclusive random temp."""
+    real = os.path.realpath(path)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp.", dir=os.path.dirname(real) or ".")
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
-        os.replace(tmp, path)
+        os.replace(tmp, real)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+class RateLimited(RuntimeError):
+    """A token endpoint answered 429: feeds the provider's 429 hold."""
+
+
+class SessionExpired(RuntimeError):
+    """The token endpoint rejected the refresh token (400/401/403)."""
+
+
+def _pct(v):
+    """A finite float percentage, or None when missing/null/garbage (never 0)."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _jwt_exp(token):
@@ -243,26 +291,43 @@ def _claude_expired(oauth):
     return bool(exp_ms) and exp_ms / 1000 <= time.time() + EXPIRY_SKEW
 
 
+def _claude_adopt(oauth, disk):
+    for k in CL_TOKEN_FIELDS:
+        if k in disk:
+            oauth[k] = disk[k]
+
+
 def _claude_refresh(root):
-    """Return a usable access token, refreshing only if really necessary."""
+    """Return (access_token, posted): a usable token, refreshing only if really
+    necessary. `posted` is True when the token endpoint was called."""
     path = CL_CREDS()
     oauth = root["claudeAiOauth"]
     held = oauth.get("accessToken")
     # A live CLI may already have rotated the tokens: the disk copy is the truth.
     disk = ((_read_json(path) or {}).get("claudeAiOauth")) or {}
     if disk.get("accessToken"):
-        for k in CL_TOKEN_FIELDS:
-            if k in disk:
-                oauth[k] = disk[k]
+        _claude_adopt(oauth, disk)
         if disk["accessToken"] != held and not _claude_expired(disk):
-            return oauth["accessToken"]
+            return oauth["accessToken"], False
+    pre_tok = oauth.get("accessToken")
     status, data = _request("POST", CL_TOKEN_URL, {}, {
         "grant_type": "refresh_token",
         "refresh_token": oauth["refreshToken"],
         "client_id": CL_CLIENT_ID,
     })
     if status < 200 or status >= 300 or not isinstance(data, dict) or not data.get("access_token"):
-        raise RuntimeError("session expired; sign in to Claude Code again")
+        # The CLI may have rotated the single-use refresh token while we were
+        # in flight: adopt what it wrote instead of reporting a false expiry.
+        disk = ((_read_json(path) or {}).get("claudeAiOauth")) or {}
+        if disk.get("accessToken") and disk["accessToken"] != pre_tok and not _claude_expired(disk):
+            _claude_adopt(oauth, disk)
+            return oauth["accessToken"], True
+        if status == 429:
+            raise RateLimited("token endpoint rate-limited (HTTP 429)")
+        if status in (400, 401, 403):
+            raise SessionExpired("session expired; sign in to Claude Code again")
+        raise RuntimeError(f"token refresh failed: HTTP {status}" if status else
+                           f"token refresh failed: {data}")
     oauth["accessToken"] = data["access_token"]
     if data.get("refresh_token"):
         oauth["refreshToken"] = data["refresh_token"]
@@ -272,29 +337,44 @@ def _claude_refresh(root):
     fresh = _read_json(path)
     if not isinstance(fresh, dict) or not isinstance(fresh.get("claudeAiOauth"), dict):
         fresh = root
+    else:
+        cur = fresh["claudeAiOauth"]
+        # Someone rotated the token during our POST and theirs is at least as
+        # fresh: keep it, don't overwrite it with ours.
+        if (cur.get("accessToken") and cur["accessToken"] != pre_tok
+                and cur["accessToken"] != oauth["accessToken"]
+                and not _claude_expired(cur)
+                and int(cur.get("expiresAt") or 0) >= int(oauth.get("expiresAt") or 0)):
+            _claude_adopt(oauth, cur)
+            return oauth["accessToken"], True
     for k in CL_TOKEN_FIELDS:
         if k in oauth:
             fresh["claudeAiOauth"][k] = oauth[k]
     _write_json_atomic(path, fresh)
-    return oauth["accessToken"]
+    return oauth["accessToken"], True
 
 
 def _claude_token(root):
     oauth = root["claudeAiOauth"]
     if not _claude_expired(oauth):
-        return oauth["accessToken"]
+        return oauth["accessToken"], False
     return _claude_refresh(root)
 
 
 def _claude_windows(usage):
-    """Prefer the self-describing limits[] array; fall back to legacy keys."""
+    """Prefer the self-describing limits[] array; fall back to legacy keys.
+    Windows without a usable utilization are skipped, never shown as 0%."""
     out = []
     limits = usage.get("limits")
     if isinstance(limits, list) and limits:
         for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            pct = _pct(lim.get("percent"))
+            if pct is None:
+                continue
             kind = lim.get("kind") or ""
             group = lim.get("group") or ""
-            pct = float(lim.get("percent") or 0)
             scope = (lim.get("scope") or {}).get("model") or {}
             model = scope.get("display_name")
             if kind == "session":
@@ -323,9 +403,11 @@ def _claude_windows(usage):
     for key, secs, label in (("five_hour", 5 * 3600, "5-hour"),
                              ("seven_day", 7 * 86400, "Weekly")):
         win = usage.get(key)
-        if not win:
+        if not isinstance(win, dict):
             continue
-        pct = float(win.get("utilization") or 0)
+        pct = _pct(win.get("utilization"))
+        if pct is None:
+            continue
         out.append({
             "id": key, "label": label,
             "group": "session" if key == "five_hour" else "weekly",
@@ -333,7 +415,35 @@ def _claude_windows(usage):
             "resetsAt": win.get("resets_at"), "active": True, "sortSeconds": secs,
             "model": None,
         })
+    for key in sorted(k for k in usage if isinstance(k, str) and k.startswith("seven_day_")):
+        win = usage.get(key)
+        model = key[len("seven_day_"):].replace("_", " ").title()
+        if not isinstance(win, dict) or not model:
+            continue
+        pct = _pct(win.get("utilization"))
+        if pct is None:
+            continue
+        out.append({
+            "id": "weekly_scoped", "label": f"Weekly · {model}", "group": "weekly",
+            "percent": round(pct, 1), "severity": _severity_from_percent(pct),
+            "resetsAt": win.get("resets_at"), "active": True, "sortSeconds": 7 * 86400,
+            "model": model,
+        })
     return out
+
+
+def _claude_spend_state(usage):
+    """Normalized extra-usage state shared by _claude_spend and _claude_extra:
+    (xu, sp, enabled, limit_reached, credits_ever_in_play)."""
+    xu = usage.get("extra_usage") if isinstance(usage.get("extra_usage"), dict) else {}
+    sp = usage.get("spend") if isinstance(usage.get("spend"), dict) else {}
+    enabled = bool(sp.get("enabled") or xu.get("is_enabled"))
+    reached = bool(xu.get("spend_limit_reached")) or \
+        str(sp.get("disabled_reason") or xu.get("disabled_reason") or "").startswith("org_level_disabled")
+    used_minor = (sp.get("used") or {}).get("amount_minor", 0) if isinstance(sp.get("used"), dict) else 0
+    ever = bool(xu.get("credits_ever_enabled")) or (xu.get("used_credits") or 0) > 0 \
+        or (used_minor or 0) > 0
+    return xu, sp, enabled, reached, ever
 
 
 def _claude_spend(usage):
@@ -344,8 +454,7 @@ def _claude_spend(usage):
     true) — i.e. exactly when you most want to see the bar. So we show spend
     whenever a limit exists and credits were ever in play, and report the
     limit-reached state instead of hiding it."""
-    xu = usage.get("extra_usage") if isinstance(usage.get("extra_usage"), dict) else {}
-    sp = usage.get("spend") if isinstance(usage.get("spend"), dict) else {}
+    xu, sp, enabled, reached, ever = _claude_spend_state(usage)
     if not sp and not xu:
         return None
 
@@ -354,11 +463,6 @@ def _claude_spend(usage):
             return None
         return f"{m['amount_minor'] / (10 ** (m.get('exponent') or 2)):.2f}"
 
-    enabled = bool(sp.get("enabled") or xu.get("is_enabled"))
-    reached = bool(xu.get("spend_limit_reached")) or \
-        (sp.get("disabled_reason") or xu.get("disabled_reason") or "").startswith("org_level_disabled")
-    ever = bool(xu.get("credits_ever_enabled")) or (xu.get("used_credits") or 0) > 0 \
-        or (sp.get("used") or {}).get("amount_minor", 0) > 0
     if not (enabled or reached or ever):
         return None  # extra usage genuinely off: nothing to meter
 
@@ -386,8 +490,14 @@ def _claude_spend(usage):
 
 
 def _claude_creds():
-    root = _read_json(_home_file(".claude", ".credentials.json"))
-    if not root or not root.get("claudeAiOauth", {}).get("accessToken"):
+    """Creds dict; None when the file is absent or holds no login. A corrupt or
+    unreadable file raises (an error, not 'unavailable')."""
+    root = _read_json_strict(_home_file(".claude", ".credentials.json"))
+    if root is None:
+        return None
+    if not isinstance(root, dict) or not isinstance(root.get("claudeAiOauth", {}), dict):
+        raise RuntimeError("Claude credentials file is malformed")
+    if not root.get("claudeAiOauth", {}).get("accessToken"):
         return None
     return root
 
@@ -401,9 +511,11 @@ def claude_fetch_raw(root):
             "anthropic-version": CL_API_VERSION,
             "Accept": "application/json",
         })
-    status, data = call(_claude_token(root))
-    if status == 401:  # refresh once, retry once
-        status, data = call(_claude_refresh(root))
+    token, posted = _claude_token(root)
+    status, data = call(token)
+    if status == 401 and not posted:  # refresh once (never twice per call), retry once
+        token, _ = _claude_refresh(root)
+        status, data = call(token)
     return status, data
 
 
@@ -412,15 +524,29 @@ _EXTRA_KEYS = ("is_enabled", "user_disabled", "spend_limit_reached",
 
 
 def _claude_extra(usage):
-    xu = usage.get("extra_usage") if isinstance(usage.get("extra_usage"), dict) else {}
-    return {k: xu.get(k) for k in _EXTRA_KEYS}
+    xu, sp, enabled, reached, _ = _claude_spend_state(usage)
+    out = {k: xu.get(k) for k in _EXTRA_KEYS}
+    if not xu and not sp:
+        return out
+    out["is_enabled"] = enabled
+    out["spend_limit_reached"] = reached
+    if sp:
+        used = sp.get("used") if isinstance(sp.get("used"), dict) else {}
+        lim = sp.get("limit") if isinstance(sp.get("limit"), dict) else {}
+        if out["used_credits"] is None and "amount_minor" in used:
+            out["used_credits"] = used["amount_minor"]
+        if out["monthly_limit"] is None and "amount_minor" in lim:
+            out["monthly_limit"] = lim["amount_minor"]
+        if out["decimal_places"] is None and (used or lim):
+            out["decimal_places"] = (used.get("exponent") or lim.get("exponent") or 2)
+    return out
 
 
 def claude_parse(root, usage):
     windows = _claude_windows(usage)
     if not windows:
         raise RuntimeError("no usage windows in response")
-    return {"tier": _claude_tier(root["claudeAiOauth"]),
+    return {"tier": _claude_tier(((root or {}).get("claudeAiOauth")) or {}),
             "windows": windows,
             "spend": _claude_spend(usage),
             "extraUsage": _claude_extra(usage)}
@@ -442,16 +568,22 @@ def _codex_expired(tok):
     return bool(exp) and exp <= time.time() + EXPIRY_SKEW
 
 
+def _codex_adopt(tokens, disk):
+    for k in CX_TOKEN_FIELDS + ("account_id",):
+        if k in disk:
+            tokens[k] = disk[k]
+
+
 def _codex_refresh(auth, path):
+    """Return (access_token, posted); see _claude_refresh."""
     tokens = auth["tokens"]
     held = tokens.get("access_token")
     disk = ((_read_json(path) or {}).get("tokens")) or {}
     if disk.get("access_token"):
-        for k in CX_TOKEN_FIELDS:
-            if k in disk:
-                tokens[k] = disk[k]
+        _codex_adopt(tokens, disk)
         if disk["access_token"] != held and not _codex_expired(disk["access_token"]):
-            return tokens["access_token"]
+            return tokens["access_token"], False
+    pre_tok = tokens.get("access_token")
     status, data = _request("POST", CX_TOKEN_URL, {}, {
         "grant_type": "refresh_token",
         "refresh_token": tokens["refresh_token"],
@@ -459,7 +591,17 @@ def _codex_refresh(auth, path):
         "scope": "openid profile email offline_access",
     })
     if status < 200 or status >= 300 or not isinstance(data, dict) or not data.get("access_token"):
-        raise RuntimeError("session expired; run `codex` to sign in again")
+        disk = ((_read_json(path) or {}).get("tokens")) or {}
+        if (disk.get("access_token") and disk["access_token"] != pre_tok
+                and not _codex_expired(disk["access_token"])):
+            _codex_adopt(tokens, disk)
+            return tokens["access_token"], True
+        if status == 429:
+            raise RateLimited("token endpoint rate-limited (HTTP 429)")
+        if status in (400, 401, 403):
+            raise SessionExpired("session expired; run `codex` to sign in again")
+        raise RuntimeError(f"token refresh failed: HTTP {status}" if status else
+                           f"token refresh failed: {data}")
     tokens["access_token"] = data["access_token"]
     if data.get("refresh_token"):
         tokens["refresh_token"] = data["refresh_token"]
@@ -470,18 +612,26 @@ def _codex_refresh(auth, path):
     fresh = _read_json(path)
     if not isinstance(fresh, dict) or not isinstance(fresh.get("tokens"), dict):
         fresh = auth
+    else:
+        cur = fresh["tokens"]
+        cur_tok = cur.get("access_token")
+        if (cur_tok and cur_tok != pre_tok and cur_tok != tokens["access_token"]
+                and not _codex_expired(cur_tok)
+                and (_jwt_exp(cur_tok) or 0) >= (_jwt_exp(tokens["access_token"]) or 0)):
+            _codex_adopt(tokens, cur)
+            return tokens["access_token"], True
     for k in CX_TOKEN_FIELDS:
         if k in tokens:
             fresh["tokens"][k] = tokens[k]
     fresh["last_refresh"] = stamp
     _write_json_atomic(path, fresh)
-    return tokens["access_token"]
+    return tokens["access_token"], True
 
 
 def _codex_token(auth, path):
     tok = auth["tokens"]["access_token"]
     if not _codex_expired(tok):
-        return tok
+        return tok, False
     return _codex_refresh(auth, path)
 
 
@@ -500,9 +650,11 @@ def _codex_windows(rate_limit):
     out = []
     for key in ("primary_window", "secondary_window"):
         win = rate_limit.get(key)
-        if not win:
+        if not isinstance(win, dict):
             continue
-        pct = float(win.get("used_percent") or 0)
+        pct = _pct(win.get("used_percent"))
+        if pct is None:
+            continue
         secs = win.get("limit_window_seconds")
         out.append({
             "id": key,
@@ -519,8 +671,12 @@ def _codex_windows(rate_limit):
 
 def _codex_creds():
     path = _codex_path()
-    auth = _read_json(path)
-    if not auth or not (auth.get("tokens") or {}).get("access_token"):
+    auth = _read_json_strict(path)
+    if auth is None:
+        return None
+    if not isinstance(auth, dict) or not isinstance(auth.get("tokens") or {}, dict):
+        raise RuntimeError("Codex auth file is malformed")
+    if not (auth.get("tokens") or {}).get("access_token"):
         return None
     return (auth, path)
 
@@ -533,15 +689,17 @@ def codex_fetch_raw(creds):
         if acct:
             headers["ChatGPT-Account-Id"] = acct
         return _request("GET", CX_USAGE_URL, headers)
-    status, data = call(_codex_token(auth, path))
-    if status == 401:  # refresh once, retry once
-        status, data = call(_codex_refresh(auth, path))
+    token, posted = _codex_token(auth, path)
+    status, data = call(token)
+    if status == 401 and not posted:  # refresh once (never twice per call), retry once
+        token, _ = _codex_refresh(auth, path)
+        status, data = call(token)
     return status, data
 
 
 def codex_parse(creds, data):
-    auth, _ = creds
-    if not data.get("rate_limit"):
+    auth = creds[0] if creds else {"tokens": {}}
+    if not isinstance(data, dict) or not data.get("rate_limit"):
         raise RuntimeError("no data")
     windows = _codex_windows(data["rate_limit"])
     if not windows:
@@ -559,9 +717,9 @@ def _openrouter_creds():
     try:
         with open(OR_KEY_FILE, "r", encoding="utf-8") as fh:
             key = fh.read().strip()
-    except Exception:
+    except FileNotFoundError:
         return None
-    return key or None
+    return key or None  # other OSErrors (permissions...) propagate: an error, not 'unavailable'
 
 
 def openrouter_fetch_raw(key):
@@ -571,6 +729,9 @@ def openrouter_fetch_raw(key):
     if status != 200 or not isinstance(credits, dict):
         return status, credits
     kstatus, keyinfo = _request("GET", OR_KEY_URL, headers)
+    if kstatus == 429 or kstatus == 0 or kstatus >= 500:
+        # Degrading to "no key cap" would understate usage: surface the failure.
+        return kstatus, keyinfo
     bundle = {"credits": credits.get("data") if isinstance(credits.get("data"), dict) else credits,
               "key": None, "keyStatus": kstatus}
     if kstatus == 200 and isinstance(keyinfo, dict):
@@ -723,7 +884,7 @@ def _lock_acquire(path, timeout=None):
     when the lock stayed busy for the whole timeout."""
     timeout = LOCK_WAIT if timeout is None else timeout
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
         return -1
@@ -777,12 +938,35 @@ def _hold_until(hit, wstate, name):
     return float(hit["at"]) + hold
 
 
+def _creds_or_error(creds_fn):
+    """(creds, error): error is set when the credentials exist but can't be read."""
+    try:
+        return creds_fn(), None
+    except Exception as e:
+        return None, f"credentials unreadable: {e}"
+
+
+def _refresh_wstate(wstate):
+    """Reload shared widget state under the provider lock (a peer may have
+    changed holds while we queued); in-memory-only keys are kept."""
+    disk = _load_state()
+    wstate.setdefault("holds", {})
+    if not isinstance(wstate["holds"], dict):
+        wstate["holds"] = {}
+    wstate["holds"].update(disk["holds"])
+    if "openrouterSeverity" in disk:
+        wstate["openrouterSeverity"] = disk["openrouterSeverity"]
+    wstate.pop("hold", None)
+
+
 def provider(name, force, wstate, now, attempt=None):
     """Compute one provider's dict. `attempt`, if given, is filled with
-    {"at", "outcome", "error"} describing what this run did."""
+    {"at", "outcome", "error"} describing what this run did. `now` is only the
+    caller's clock: freshness is judged with a clock read after taking the lock."""
     attempt = attempt if attempt is not None else {}
     creds_fn = PROVIDERS[name][0]
-    if creds_fn() is None:
+    creds, cerr = _creds_or_error(creds_fn)
+    if creds is None and cerr is None:
         attempt.update(at=None, outcome="unavailable", error=None)
         return {"available": False}
     wstate.setdefault("holds", {})
@@ -790,15 +974,12 @@ def provider(name, force, wstate, now, attempt=None):
         wstate["holds"] = {}
     wstate.pop("hold", None)
 
-    cache_path, _ = _cache_paths(name)
-    t0 = time.monotonic()
     fd = _lock_acquire(os.path.join(CACHE_DIR, f"{name}.lock"))
     try:
         if fd is None:
-            return _serve_busy(name, creds_fn(), attempt, now)
-        if time.monotonic() - t0 > 0.5:
-            now = max(now, time.time())  # we queued; don't judge freshness by a stale clock
-        return _provider_locked(name, force, wstate, now, attempt)
+            return _serve_busy(name, creds, attempt, time.time())
+        _refresh_wstate(wstate)
+        return _provider_locked(name, force, wstate, time.time(), attempt)
     finally:
         _lock_release(fd)
 
@@ -822,64 +1003,82 @@ def _serve_busy(name, creds, attempt, now):
 
 def _provider_locked(name, force, wstate, now, attempt):
     creds_fn, fetch_raw, parse, expired_msg = PROVIDERS[name]
-    creds = creds_fn()  # re-read under the lock: a peer may have rotated tokens
-    if creds is None:
+    creds, cerr = _creds_or_error(creds_fn)  # re-read under the lock: a peer may have rotated tokens
+    if creds is None and cerr is None:
         attempt.update(at=None, outcome="unavailable", error=None)
         return {"available": False}
 
     cache_path, hit_path = _cache_paths(name)
     cache = _read_json(cache_path)  # RE-READ after taking the lock
     hit = _read_json(hit_path)
-    cached_at = float(cache.get("fetchedAt") or 0) if isinstance(cache, dict) else 0
+    try:
+        cached_at = float(cache.get("fetchedAt") or 0) if isinstance(cache, dict) else 0
+    except (TypeError, ValueError):
+        cached_at = 0
     age = now - cached_at if cached_at else None
+    have_cache = age is not None and isinstance(cache, dict)
 
-    def from_cache(error, stale, outcome):
+    def from_cache(error, stale, outcome, strict=False):
         out = {"available": True, "error": error, "stale": stale,
                "fetchedAt": int(cached_at), "source": cache.get("source") or "?",
                "windows": [], "spend": None, "tier": None, "plan": None}
         try:
             out.update(parse(creds, cache["response"]))
         except Exception as e:
+            if strict:
+                return None
             out["error"] = error or f"bad cached data: {e}"
+            out["stale"] = True
             if not error:
                 outcome = "stale"
-        attempt.update(at=now, outcome=outcome, error=out["error"])
+        attempt.update(at=time.time(), outcome=outcome, error=out["error"])
         return out
 
     def empty(error, outcome):
-        attempt.update(at=now, outcome=outcome, error=error)
+        attempt.update(at=time.time(), outcome=outcome, error=error)
         return {"available": True, "error": error, "stale": True, "fetchedAt": 0,
                 "source": None, "windows": [], "spend": None, "tier": None, "plan": None}
 
-    # 1. Fresh enough: display it, no network.
+    def fail(error, outcome):
+        return from_cache(error, True, outcome) if have_cache else empty(error, outcome)
+
+    if cerr is not None:
+        return fail(cerr, "error")
+
+    # 1. Fresh enough: display it, no network. A cache that doesn't parse
+    #    falls through to a fetch.
     max_age = FORCE_FLOOR if force else WIDGET_MAX_AGE
-    if age is not None and age < max_age:
-        return from_cache(None, False, "cache")
+    if have_cache and 0 <= age < max_age:
+        out = from_cache(None, False, "cache", strict=True)
+        if out is not None:
+            return out
 
     # 2. Somebody was rate-limited recently: yield, show what we have.
     until = _hold_until(hit, wstate, name)
     if now < until:
         who = "widget" if hit.get("source") == "widget" else "crew"
         msg = f"yielding · {who} rate-limited {_fmt_age(now - float(hit['at']))} ago"
-        return from_cache(msg, True, "rate-limited") if age is not None else empty(msg, "rate-limited")
+        return fail(msg, "rate-limited")
 
     # 3. Fetch ourselves and share the answer.
     try:
         status, data = fetch_raw(creds)
+    except RateLimited as e:
+        status, data = 429, str(e)
     except Exception as e:
         status, data = -1, str(e)
+    done = time.time()  # stamp everything with the post-fetch clock
 
     if status == 429:
         hold = min(HOLD_MAX, max(HOLD_MIN, int(wstate["holds"].get(name) or 0) * 2))
         wstate["holds"][name] = hold
         _persist_hold(name, hold)
-        _write_cache(hit_path, {"at": now, "source": "widget"})
-        msg = f"rate-limited · holding {_fmt_age(hold)}"
-        return from_cache(msg, True, "rate-limited") if age is not None else empty(msg, "rate-limited")
+        _write_cache(hit_path, {"at": done, "source": "widget"})
+        return fail(f"rate-limited · holding {_fmt_age(hold)}", "rate-limited")
 
     if status == 401:
         error = expired_msg
-    elif status == -1:
+    elif status == -1 or status == 0:
         error = str(data)
     elif status < 200 or status >= 300 or not isinstance(data, dict):
         error = f"HTTP {status}"
@@ -892,48 +1091,93 @@ def _provider_locked(name, force, wstate, now, attempt):
             if wstate["holds"].get(name):
                 wstate["holds"][name] = 0
                 _persist_hold(name, 0)
-            _write_cache(cache_path, {"fetchedAt": int(now), "source": "widget", "response": data})
+            _write_cache(cache_path, {"fetchedAt": int(done), "source": "widget", "response": data})
             out = {"available": True, "error": None, "stale": False,
-                   "fetchedAt": int(now), "source": "widget"}
+                   "fetchedAt": int(done), "source": "widget"}
             out.update(parsed)
-            attempt.update(at=now, outcome="fetched", error=None)
+            attempt.update(at=done, outcome="fetched", error=None)
             return out
 
-    return from_cache(error, True, "error") if age is not None else empty(error, "error")
+    return fail(error, "error")
 
 
 # --------------------------------------------------------------------------- #
-def _argval(argv, flag):
-    if flag in argv:
-        i = argv.index(flag)
-        if i + 1 < len(argv):
-            return argv[i + 1]
-    return None
+def _max_age_arg(v):
+    try:
+        f = float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {v!r}")
+    if not math.isfinite(f) or f < 0:
+        raise argparse.ArgumentTypeError("must be a finite, non-negative number of seconds")
+    return f
+
+
+def _build_parser():
+    ap = argparse.ArgumentParser(prog="aiusage.py", allow_abbrev=False,
+                                 description="Claude/Codex/OpenRouter usage as normalized JSON.")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore --max-age/WIDGET_MAX_AGE (60 s floor and 429 holds still apply)")
+    ap.add_argument("--pretty", action="store_true", help="indent the JSON output")
+    ap.add_argument("--no-notify", action="store_true", help="no desktop notification on a floor crossing")
+    ap.add_argument("--or-floors", metavar="WARN,CRIT", help="OpenRouter balance floors in USD")
+    ap.add_argument("--max-age", type=_max_age_arg, metavar="SECONDS",
+                    help="reuse cache younger than this (default %d)" % WIDGET_MAX_AGE)
+    ap.add_argument("--status-file", metavar="PATH", help="also write the machine-readable status file here")
+    return ap
 
 
 def _parse_args(argv):
-    """Sets module options; returns the --status-file path (or None)."""
+    """Sets module options; returns the parsed namespace (argv excludes the program name)."""
     global OR_FLOORS, OR_NOTIFY, WIDGET_MAX_AGE
-    if "--no-notify" in argv:
+    args = _build_parser().parse_args(argv)
+    if args.no_notify:
         OR_NOTIFY = False
-    if "--or-floors" in argv:
+    if args.or_floors is not None:
         try:
-            warn, crit = (float(x) for x in _argval(argv, "--or-floors").split(",")[:2])
+            warn, crit = (float(x) for x in args.or_floors.split(",")[:2])
             OR_FLOORS = [max(warn, crit), min(warn, crit)]
         except Exception:
             pass
-    raw = _argval(argv, "--max-age")
-    if raw is not None:
-        try:
-            WIDGET_MAX_AGE = max(0.0, float(raw))
-        except ValueError:
-            pass
-    return _argval(argv, "--status-file")
+    if args.max_age is not None:
+        WIDGET_MAX_AGE = args.max_age
+    return args
+
+
+def _fetched_at(d):
+    try:
+        return float(d.get("fetchedAt") or 0) if isinstance(d, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _write_status_file(status_file, providers):
+    """Serialize writers under <status_file>.lock and merge per provider so an
+    older fetchedAt never replaces a newer one already on disk. Raises on failure."""
+    real = os.path.realpath(status_file)
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    fd = _lock_acquire(real + ".lock", 10)
+    if fd is None:
+        raise RuntimeError("timed out waiting for the status-file lock")
+    try:
+        existing = _read_json(real)
+        old = existing.get("providers") if isinstance(existing, dict) else None
+        merged = {}
+        for name, d in providers.items():
+            prev = old.get(name) if isinstance(old, dict) else None
+            if (isinstance(prev, dict) and d.get("available") is not False
+                    and _fetched_at(prev) > _fetched_at(d)):
+                merged[name] = prev
+            else:
+                merged[name] = d
+        _write_json_atomic(real, {"generatedAt": int(time.time()), "providers": merged})
+    finally:
+        _lock_release(fd)
 
 
 def main():
-    status_file = _parse_args(sys.argv)
-    force = "--force" in sys.argv
+    args = _parse_args(sys.argv[1:])
+    status_file = args.status_file
+    force = args.force
     now = time.time()
     wstate = _load_state()
     out = {"generatedAt": int(now)}
@@ -945,7 +1189,8 @@ def main():
         except Exception as e:  # never let one provider take the widget down
             out[name] = {"available": True, "error": str(e), "stale": True,
                          "windows": [], "spend": None}
-            attempts[name].update(at=now, outcome="error", error=str(e))
+            attempts[name].update(at=time.time(), outcome="error", error=str(e))
+    out["generatedAt"] = int(time.time())
     if isinstance(out.get("openrouter"), dict):
         prev = wstate.get("openrouterSeverity")
         _openrouter_notify(out["openrouter"], wstate)
@@ -957,9 +1202,9 @@ def main():
                 _write_cache(WIDGET_STATE, st)
             finally:
                 _lock_release(fd)
-    pretty = "--pretty" in sys.argv
-    json.dump(out, sys.stdout, indent=2 if pretty else None)
+    json.dump(out, sys.stdout, indent=2 if args.pretty else None)
     sys.stdout.write("\n")
+    sys.stdout.flush()
     if status_file:
         providers = {}
         for name in PROVIDERS:
@@ -970,10 +1215,10 @@ def main():
                                 "error": a.get("error")}
             providers[name] = d
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(status_file)), exist_ok=True)
-            _write_json_atomic(status_file, {"generatedAt": int(now), "providers": providers})
+            _write_status_file(status_file, providers)
         except Exception as e:
             sys.stderr.write(f"aiusage: cannot write status file: {e}\n")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
