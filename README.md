@@ -96,3 +96,18 @@ it on a timer via Plasma's executable data source and just draws the result.
 ## License
 
 GPL-3.0-or-later.
+
+## Using it from scripts
+
+`aiusage.py` is the only thing that should call the usage endpoints, so other
+tools should run it instead of hitting the APIs. It is safe to run concurrently
+(per-provider file locks) and honours per-provider 429 holds.
+
+```sh
+python3 aiusage.py --no-notify --max-age 300 --status-file ~/.cache/ai-usage/status.json >/dev/null
+```
+
+`--max-age SECONDS` reuses the shared cache if it is younger than that (default
+600). `--status-file PATH` atomically writes a 0600 JSON document with
+`generatedAt` and, per provider, the same data as stdout plus
+`lastAttempt {at, outcome, error}`.
