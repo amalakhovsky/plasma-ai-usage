@@ -22,7 +22,7 @@ PlasmoidItem {
     readonly property string helperCmd: "python3 '" + helperPath + "'"
         + " --or-floors " + Number(Plasmoid.configuration.orWarnUsd) + "," + Number(Plasmoid.configuration.orCritUsd)
         + (Plasmoid.configuration.orNotify ? "" : " --no-notify")
-    readonly property var providerNames: ["claude", "codex", "openrouter"]
+    readonly property var providerNames: ["claude", "codex", "agy", "openrouter"]
     readonly property string orLabel: Plasmoid.configuration.orLabel || "dollars"
 
     // 5 min default: the usage endpoints 429 easily and the helper caches +
@@ -47,6 +47,7 @@ PlasmoidItem {
     }
     function titleFor(name) {
         if (name === "openrouter") return "OpenRouter";
+        if (name === "agy") return "Gemini";
         return name.charAt(0).toUpperCase() + name.slice(1);
     }
     function anyAvailable() {
@@ -195,6 +196,7 @@ PlasmoidItem {
         Layout.minimumWidth: implicitWidth
         ProviderChip { provider: "claude" }
         ProviderChip { provider: "codex" }
+        ProviderChip { provider: "agy" }
         ProviderChip { provider: "openrouter" }
         MouseArea {
             visible: !root.anyAvailable()

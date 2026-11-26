@@ -68,6 +68,7 @@ Stdlib only, so it runs anywhere python3 does.
 """
 import argparse
 import base64
+import datetime
 import fcntl
 import json
 import math
@@ -853,6 +854,60 @@ def _openrouter_notify(result, wstate):
 
 
 # --------------------------------------------------------------------------- #
+# Gemini / agy — read-only: agy.json is written by `crew agy-usage` (agy -p /usage);
+# this helper never launches agy itself.
+# --------------------------------------------------------------------------- #
+AGY_FILE = os.path.join(CACHE_DIR, "agy.json")
+AGY_STALE_SECS = 30 * 60
+_AGY_POOLS = (("gemini", "Gemini", 0), ("claude_gpt", "Claude/GPT", 1))
+
+
+def agy_from_file(now=None):
+    now = time.time() if now is None else now
+    doc = _read_json(AGY_FILE)
+    if not isinstance(doc, dict) or not isinstance(doc.get("response"), dict):
+        return {"available": False, "windows": [], "spend": None}
+    fetched = _fetched_at(doc)
+    windows = []
+    for p in doc["response"].get("pools") or []:
+        if not isinstance(p, dict):
+            continue
+        meta = next((m for m in _AGY_POOLS if m[0] == p.get("pool")), None)
+        pct = _pct(p.get("pct_used"))
+        if meta is None or pct is None:
+            continue
+        secs = 18000 if p.get("window") == "5h" else 604800
+        reset = p.get("resetsAt")
+        try:
+            passed = bool(reset) and datetime.datetime.fromisoformat(
+                str(reset).replace("Z", "+00:00")).timestamp() <= now
+        except ValueError:
+            passed = False
+        if passed:  # the window rolled over since the last check: it is fresh
+            pct, reset = 0.0, None
+        windows.append({
+            "id": f"{meta[0]}_{p.get('window')}",
+            "label": f"{meta[1]} {_humanize_seconds(secs)}",
+            "group": "session" if secs <= 6 * 3600 else "weekly",
+            "percent": round(pct, 1),
+            "severity": _severity_from_percent(pct),
+            "resetsAt": reset,
+            # an unused pool (agy reports reset 1970) is shown dimmed
+            "active": bool(reset) or pct > 0,
+            # Gemini sorts ahead of Claude/GPT so the panel ring tracks the Gemini pool
+            "sortSeconds": secs + meta[2],
+        })
+    windows.sort(key=lambda w: (not w["id"].startswith("gemini"), w["sortSeconds"]))
+    stale = now - fetched > AGY_STALE_SECS
+    credits = doc["response"].get("credits")
+    return {"available": True, "fetchedAt": fetched, "source": doc.get("source"),
+            "stale": stale,
+            "error": (f"last checked {_fmt_age(now - fetched)} ago" if stale else None),
+            "windows": windows, "spend": None, "tier": None,
+            "plan": (f"{credits:g} credits" if isinstance(credits, (int, float)) and credits > 0 else None)}
+
+
+# --------------------------------------------------------------------------- #
 # shared cache + yield policy
 # --------------------------------------------------------------------------- #
 PROVIDERS = {
@@ -1190,6 +1245,11 @@ def main():
             out[name] = {"available": True, "error": str(e), "stale": True,
                          "windows": [], "spend": None}
             attempts[name].update(at=time.time(), outcome="error", error=str(e))
+    try:
+        out["agy"] = agy_from_file()
+    except Exception as e:
+        out["agy"] = {"available": True, "error": str(e), "stale": True,
+                      "windows": [], "spend": None}
     out["generatedAt"] = int(time.time())
     if isinstance(out.get("openrouter"), dict):
         prev = wstate.get("openrouterSeverity")

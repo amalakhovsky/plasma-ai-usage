@@ -28,6 +28,9 @@ The KDE counterpart to the GNOME
   labelled with the dollars left on the account (or the percentage). The ring turns
   amber/red when the prepaid balance drops below thresholds you set, and can send a
   desktop notification when it crosses one.
+- **Gemini ring** (optional): the Antigravity (`agy`) Gemini and Claude/GPT pools, read
+  from `~/.cache/ai-usage/agy.json`. The widget never launches `agy`; something else must
+  write that file (e.g. a timer running `agy -p /usage`). Dimmed once it is >30 min old.
 
 ## Privacy
 

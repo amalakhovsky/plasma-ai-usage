@@ -513,6 +513,42 @@ class TestCacheAndStatus(Base):
         self.assertEqual(cm.exception.code, 1)
 
 
+class TestAgy(Base):
+    def write(self, fetched, pools, credits=0.0):
+        self.m.AGY_FILE = os.path.join(self.tmp.name, "agy.json")
+        with open(self.m.AGY_FILE, "w") as f:
+            json.dump({"fetchedAt": fetched, "source": "crew agy-usage",
+                       "response": {"pools": pools, "credits": credits}}, f)
+
+    def test_missing_file_is_unavailable(self):
+        self.m.AGY_FILE = os.path.join(self.tmp.name, "nope.json")
+        self.assertFalse(self.m.agy_from_file()["available"])
+
+    def test_windows_rollover_and_order(self):
+        now = 2_000_000_000
+        self.write(now - 60, [
+            {"pool": "claude_gpt", "window": "5h", "pct_used": 0.0, "resetsAt": None},
+            {"pool": "gemini", "window": "weekly", "pct_used": 13.0, "resetsAt": "2033-06-01T00:00:00Z"},
+            {"pool": "gemini", "window": "5h", "pct_used": 50.0, "resetsAt": "2020-01-01T00:00:00Z"},
+        ])
+        d = self.m.agy_from_file(now)
+        self.assertFalse(d["stale"])
+        self.assertEqual([w["id"] for w in d["windows"]], ["gemini_5h", "gemini_weekly", "claude_gpt_5h"])
+        g5 = d["windows"][0]
+        self.assertEqual((g5["percent"], g5["resetsAt"]), (0.0, None))  # reset already passed
+        self.assertEqual(d["windows"][1]["percent"], 13.0)
+        self.assertFalse(d["windows"][2]["active"])                       # unused pool dimmed
+        self.assertIsNone(d["plan"])
+
+    def test_stale(self):
+        now = 2_000_000_000
+        self.write(now - 3 * 3600, [{"pool": "gemini", "window": "5h", "pct_used": 5, "resetsAt": None}], 7)
+        d = self.m.agy_from_file(now)
+        self.assertTrue(d["stale"])
+        self.assertIn("3h", d["error"])
+        self.assertEqual(d["plan"], "7 credits")
+
+
 class TestArgs(unittest.TestCase):
     def setUp(self):
         self.m = load()

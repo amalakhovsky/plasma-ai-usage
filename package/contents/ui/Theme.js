@@ -2,7 +2,7 @@
 
 // Brand base hues (shown when a provider is healthy) and the severity ramp
 // toward red. The ramp mirrors the GNOME extension's level palette.
-var BRAND = { claude: "#d97757", codex: "#10a37f", openrouter: "#6467f2" };
+var BRAND = { claude: "#d97757", codex: "#10a37f", agy: "#4285f4", openrouter: "#6467f2" };
 var SEV   = { ok: null, warn: "#ff7800", crit: "#e01b24" };
 
 // Ring/bar fill color: brand hue at "ok", shifting toward amber then red as
