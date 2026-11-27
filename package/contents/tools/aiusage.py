@@ -304,9 +304,12 @@ def _claude_adopt(oauth, disk):
             oauth[k] = disk[k]
 
 
-def _claude_refresh(root):
+def _claude_refresh(root, force=False):
     """Return (access_token, posted): a usable token, refreshing only if really
-    necessary. `posted` is True when the token endpoint was called."""
+    necessary. `posted` is True when the token endpoint was called. With force
+    (the server just rejected our token with 401) the token endpoint is hit
+    even when the token is not locally expired, unless the file on disk already
+    holds a different token, which is adopted instead."""
     path = CL_CREDS()
     oauth = root["claudeAiOauth"]
     held = oauth.get("accessToken")
@@ -318,7 +321,7 @@ def _claude_refresh(root):
         if ((disk["accessToken"] != held or disk.get("refreshToken") != held_ref)
                 and not _claude_expired(disk)):
             return oauth["accessToken"], False
-    if not _claude_expired(oauth):
+    if not force and not _claude_expired(oauth):
         return oauth["accessToken"], False  # only step in when nobody else has
     pre_tok = oauth.get("accessToken")
     pre_ref = oauth.get("refreshToken")
@@ -521,7 +524,7 @@ def claude_fetch_raw(root):
     token, posted = _claude_token(root)
     status, data = call(token)
     if status == 401 and not posted:  # refresh once (never twice per call), retry once
-        token, _ = _claude_refresh(root)
+        token, _ = _claude_refresh(root, force=True)
         status, data = call(token)
     return status, data
 
@@ -581,8 +584,8 @@ def _codex_adopt(tokens, disk):
             tokens[k] = disk[k]
 
 
-def _codex_refresh(auth, path):
-    """Return (access_token, posted); see _claude_refresh."""
+def _codex_refresh(auth, path, force=False):
+    """Return (access_token, posted); see _claude_refresh (incl. force)."""
     tokens = auth["tokens"]
     held = tokens.get("access_token")
     held_ref = tokens.get("refresh_token")
@@ -592,7 +595,7 @@ def _codex_refresh(auth, path):
         if ((disk["access_token"] != held or disk.get("refresh_token") != held_ref)
                 and not _codex_expired(disk["access_token"])):
             return tokens["access_token"], False
-    if not _codex_expired(tokens.get("access_token")):
+    if not force and not _codex_expired(tokens.get("access_token")):
         return tokens["access_token"], False  # only step in when nobody else has
     pre_tok = tokens.get("access_token")
     pre_ref = tokens.get("refresh_token")
@@ -702,7 +705,7 @@ def codex_fetch_raw(creds):
     token, posted = _codex_token(auth, path)
     status, data = call(token)
     if status == 401 and not posted:  # refresh once (never twice per call), retry once
-        token, _ = _codex_refresh(auth, path)
+        token, _ = _codex_refresh(auth, path, force=True)
         status, data = call(token)
     return status, data
 
@@ -1221,6 +1224,9 @@ def _fetched_at(d):
         return 0.0
 
 
+STATUS_FUTURE_SKEW = 60  # a previous entry dated further ahead than this is never kept
+
+
 def _write_status_file(status_file, providers):
     """Serialize writers under <status_file>.lock and merge per provider so an
     older fetchedAt never replaces a newer one already on disk. Raises on failure."""
@@ -1229,15 +1235,27 @@ def _write_status_file(status_file, providers):
     fd = _lock_acquire(real + ".lock", 10)
     if fd is None:
         raise RuntimeError("timed out waiting for the status-file lock")
+    if fd < 0:
+        raise RuntimeError("cannot lock the status file")
     try:
         existing = _read_json(real)
         old = existing.get("providers") if isinstance(existing, dict) else None
         merged = {}
+        now = time.time()
         for name, d in providers.items():
             prev = old.get(name) if isinstance(old, dict) else None
+            prev_at = _fetched_at(prev)
             if (isinstance(prev, dict) and d.get("available") is not False
-                    and _fetched_at(prev) > _fetched_at(d)):
-                merged[name] = prev
+                    and prev_at > _fetched_at(d)
+                    and prev_at <= now + STATUS_FUTURE_SKEW):  # future-dated: clock stepped back
+                # Keep the newer windows, but say what this run saw.
+                keep = dict(prev)
+                if "lastAttempt" in d:
+                    keep["lastAttempt"] = d["lastAttempt"]
+                if d.get("error") or d.get("stale"):
+                    keep["error"] = d.get("error") or keep.get("error")
+                    keep["stale"] = True
+                merged[name] = keep
             else:
                 merged[name] = d
         _write_json_atomic(real, {"generatedAt": int(time.time()), "providers": merged})

@@ -449,6 +449,92 @@ class TestRefresh(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(len(self.token_posts()), 1)
 
+    def usage_401_then_200(self):
+        seq = [401, 200]
+        real = self.fake_request
+        def req(method, url, headers, body=None):
+            if url in (self.m.CL_USAGE_URL, self.m.CX_USAGE_URL):
+                self.usage_status = seq.pop(0) if seq else 200
+            return real(method, url, headers, body)
+        return req
+
+    def test_401_forces_refresh_of_unexpired_token(self):
+        # server-side revoked token that is not locally expired: must POST
+        now_ms = int(time.time() * 1000)
+        self.write_claude("live", "r1", now_ms + 3600_000, keep=1)
+        self.m._request = self.usage_401_then_200()
+        root = {"claudeAiOauth": {"accessToken": "live", "refreshToken": "r1",
+                                  "expiresAt": now_ms + 3600_000}}
+        status, _ = self.m.claude_fetch_raw(root)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.token_posts(), [self.m.CL_TOKEN_URL])
+        self.assertEqual(self.requests[-1][2]["Authorization"], "Bearer NEWTOK")
+        with open(self.path) as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["claudeAiOauth"]["accessToken"], "NEWTOK")
+        self.assertEqual(saved["keep"], 1)
+        # codex, opaque (non-JWT) token: never "expired" locally
+        path = os.path.join(self.tmp.name, "auth.json")
+        with open(path, "w") as fh:
+            json.dump({"tokens": {"access_token": "opaque", "refresh_token": "r1"}, "x": 1}, fh)
+        self.requests = []
+        self.m._request = self.usage_401_then_200()
+        auth = {"tokens": {"access_token": "opaque", "refresh_token": "r1"}}
+        status, _ = self.m.codex_fetch_raw((auth, path))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.token_posts(), [self.m.CX_TOKEN_URL])
+        with open(path) as fh:
+            saved = json.load(fh)
+        self.assertEqual((saved["tokens"]["access_token"], saved["x"]), ("NEWTOK", 1))
+
+    def test_401_adopts_different_disk_token_without_post(self):
+        now_ms = int(time.time() * 1000)
+        self.write_claude("cli", "rcli", now_ms + 3600_000)
+        self.m._request = self.usage_401_then_200()
+        root = {"claudeAiOauth": {"accessToken": "live", "refreshToken": "r1",
+                                  "expiresAt": now_ms + 3600_000}}
+        status, _ = self.m.claude_fetch_raw(root)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.token_posts(), [])
+        self.assertEqual(self.requests[-1][2]["Authorization"], "Bearer cli")
+        path = os.path.join(self.tmp.name, "auth.json")
+        with open(path, "w") as fh:
+            json.dump({"tokens": {"access_token": "cli", "refresh_token": "r2"}}, fh)
+        self.requests = []
+        self.m._request = self.usage_401_then_200()
+        auth = {"tokens": {"access_token": "opaque", "refresh_token": "r1"}}
+        self.m.codex_fetch_raw((auth, path))
+        self.assertEqual(self.token_posts(), [])
+        self.assertEqual(self.requests[-1][2]["Authorization"], "Bearer cli")
+
+    def test_forced_refresh_adopts_mid_post_rotation(self):
+        now_ms = int(time.time() * 1000)
+        self.write_claude("live", "r1", now_ms + 3600_000)
+        self.hook = lambda: self.write_claude("cli", "rcli", now_ms + 7200_000, keep=1)
+        self.m._request = self.usage_401_then_200()
+        root = {"claudeAiOauth": {"accessToken": "live", "refreshToken": "r1",
+                                  "expiresAt": now_ms + 3600_000}}
+        self.m.claude_fetch_raw(root)
+        self.assertEqual(len(self.token_posts()), 1)
+        saved = self.read_claude()
+        self.assertEqual((saved["accessToken"], saved["refreshToken"]), ("cli", "rcli"))
+        self.assertEqual(self.requests[-1][2]["Authorization"], "Bearer cli")
+
+    def test_forced_refresh_aborts_on_unreadable_fresh_copy(self):
+        now_ms = int(time.time() * 1000)
+        self.write_claude("live", "r1", now_ms + 3600_000)
+        def corrupt():
+            with open(self.path, "w") as fh:
+                fh.write('{"claudeAiOauth": {"acc')
+        self.hook = corrupt
+        self.m._request = self.usage_401_then_200()
+        root = {"claudeAiOauth": {"accessToken": "live", "refreshToken": "r1",
+                                  "expiresAt": now_ms + 3600_000}}
+        with self.assertRaises(Exception):
+            self.m.claude_fetch_raw(root)
+        with open(self.path) as fh:
+            self.assertEqual(fh.read(), '{"claudeAiOauth": {"acc')
+
     def test_corrupt_creds_is_error_with_stale_cache(self):
         with open(self.path, "w") as fh:
             fh.write('{"claudeAiOauth": {"acc')
@@ -580,6 +666,45 @@ class TestCacheAndStatus(Base):
         self.assertEqual(p["claude"]["windows"][0]["percent"], 96)
         self.assertEqual(p["codex"]["fetchedAt"], 1100)
         self.assertEqual(oct(os.stat(sf).st_mode & 0o777), "0o600")
+
+    def test_status_merge_drops_future_dated_prev(self):
+        sf = os.path.join(self.tmp.name, "s", "status.json")
+        now = int(time.time())
+        mk = lambda ts, pct: {"available": True, "fetchedAt": ts, "windows": [{"percent": pct}],
+                              "lastAttempt": {"at": ts, "outcome": "fetched", "error": None}}
+        self.m._write_status_file(sf, {"claude": mk(now + 86400, 96)})  # clock stepped back
+        self.m._write_status_file(sf, {"claude": mk(now, 40)})
+        with open(sf) as fh:
+            p = json.load(fh)["providers"]
+        self.assertEqual((p["claude"]["fetchedAt"], p["claude"]["windows"][0]["percent"]), (now, 40))
+        # within the skew allowance a slightly-ahead prev is still kept
+        self.m._write_status_file(sf, {"claude": mk(now + 30, 50)})
+        self.m._write_status_file(sf, {"claude": mk(now, 41)})
+        with open(sf) as fh:
+            self.assertEqual(json.load(fh)["providers"]["claude"]["windows"][0]["percent"], 50)
+
+    def test_status_merge_kept_prev_surfaces_failure(self):
+        sf = os.path.join(self.tmp.name, "s", "status.json")
+        now = int(time.time())
+        good = {"available": True, "error": None, "stale": False, "fetchedAt": now - 100,
+                "windows": [{"percent": 96}],
+                "lastAttempt": {"at": now - 100, "outcome": "fetched", "error": None}}
+        failed = {"available": True, "error": "HTTP 500", "stale": True, "fetchedAt": 0,
+                  "windows": [], "lastAttempt": {"at": now, "outcome": "error", "error": "HTTP 500"}}
+        self.m._write_status_file(sf, {"claude": good})
+        self.m._write_status_file(sf, {"claude": failed})
+        with open(sf) as fh:
+            c = json.load(fh)["providers"]["claude"]
+        self.assertEqual((c["fetchedAt"], c["windows"]), (now - 100, [{"percent": 96}]))
+        self.assertEqual(c["lastAttempt"], failed["lastAttempt"])
+        self.assertEqual((c["error"], c["stale"]), ("HTTP 500", True))
+
+    def test_status_write_unlockable_raises(self):
+        sf = os.path.join(self.tmp.name, "s", "status.json")
+        self.m._lock_acquire = lambda path, timeout=None: -1
+        with self.assertRaises(RuntimeError):
+            self.m._write_status_file(sf, {"claude": {"available": True, "fetchedAt": 1}})
+        self.assertFalse(os.path.exists(sf))
 
     def test_status_write_failure_exits_nonzero(self):
         import io
