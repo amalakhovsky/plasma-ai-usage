@@ -1243,6 +1243,22 @@ def _attempt_at(d):
 STATUS_FUTURE_SKEW = 60  # a previous entry dated further ahead than this is never kept
 
 
+def _tie_keeps_prev(prev, d, d_busy):
+    """Both entries carry the same data (equal fetchedAt): which one says the right thing?
+    A lock-timeout waiter ("busy") never fetched, so it never overrides anything — and an
+    entry it left is always replaced by a real attempt. Between real attempts, a clean cache
+    read can't clear a recorded fetch failure, and an older attempt never overrides a newer."""
+    if d_busy:
+        return True
+    if prev.get("error") == "busy":
+        return False
+    if (prev.get("error") or prev.get("stale")) and not d.get("error") \
+            and _attempt(d).get("outcome") != "fetched":
+        return True
+    pa, da = _attempt_at(prev), _attempt_at(d)
+    return pa is not None and da is not None and da < pa
+
+
 def _write_status_file(status_file, providers):
     """Serialize writers under <status_file>.lock and merge per provider so an
     older fetchedAt never replaces a newer one already on disk. Raises on failure."""
@@ -1279,13 +1295,7 @@ def _write_status_file(status_file, providers):
                         keep["error"] = d.get("error") or keep.get("error")
                         keep["stale"] = True
                 merged[name] = keep
-            elif prev_at == _fetched_at(d) and (d_busy or (
-                    (prev.get("error") or prev.get("stale")) and _attempt(d).get("outcome") != "fetched")
-                    or (_attempt_at(prev) is not None and _attempt_at(d) is not None
-                        and _attempt_at(d) < _attempt_at(prev))):
-                # Same data on both sides. A lock-timeout waiter never fetched; only a live
-                # successful fetch may clear a recorded failure; an older attempt never
-                # overrides a newer one.
+            elif prev_at == _fetched_at(d) and _tie_keeps_prev(prev, d, d_busy):
                 merged[name] = prev
             else:
                 merged[name] = d

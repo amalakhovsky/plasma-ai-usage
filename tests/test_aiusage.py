@@ -840,6 +840,22 @@ class TestStatusTieKeepsFailure(Base):
               "lastAttempt": {"at": t0 + 50, "outcome": "fetched", "error": None}}
         self.assertIsNone(self._merge(prev, ok)["error"])
 
+    def test_busy_entry_is_replaced_by_any_real_attempt(self):
+        t0 = int(time.time()) - 60
+        busy = {"available": True, "fetchedAt": t0, "stale": True, "error": "busy",
+                "lastAttempt": {"at": t0 + 40, "outcome": "busy", "error": "busy"}}
+        failed = {"available": True, "fetchedAt": t0, "stale": True, "error": "HTTP 429",
+                  "lastAttempt": {"at": t0 + 50, "outcome": "error", "error": "HTTP 429"}}
+        self.assertEqual(self._merge(busy, failed)["error"], "HTTP 429")
+        holder = {"available": True, "fetchedAt": t0, "stale": False, "error": None,
+                  "lastAttempt": {"at": t0 + 10, "outcome": "fetched", "error": None}}
+        self.assertIsNone(self._merge(busy, holder)["error"])  # earlier attempt, still real
+        cached = {"available": True, "fetchedAt": t0, "stale": False, "error": None,
+                  "lastAttempt": {"at": t0 + 70, "outcome": "cache", "error": None}}
+        self.assertIsNone(self._merge(busy, cached)["error"])
+        newer_fail = dict(failed, error="HTTP 500", lastAttempt={"at": t0 + 90, "outcome": "error", "error": "HTTP 500"})
+        self.assertEqual(self._merge(failed, newer_fail)["error"], "HTTP 500")
+
 
 class TestArgs(unittest.TestCase):
     def setUp(self):
