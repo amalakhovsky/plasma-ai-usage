@@ -744,12 +744,13 @@ class TestCacheAndStatus(Base):
         self.m._write_status_file(sf, {"claude": waiter})
         with open(sf) as fh:
             self.assertEqual(json.load(fh)["providers"]["claude"], holder)
-        # but a tie where prev already carries an error is still taken from d
+        # a tie where prev carries a real failure keeps that failure (a busy waiter never
+        # fetched, so it must not turn the error into the gate-exempt "busy")
         errored = dict(holder, error="HTTP 500", stale=True)
         self.m._write_status_file(sf, {"claude": errored})
         self.m._write_status_file(sf, {"claude": waiter})
         with open(sf) as fh:
-            self.assertEqual(json.load(fh)["providers"]["claude"], waiter)
+            self.assertEqual(json.load(fh)["providers"]["claude"], errored)
         # and a non-busy tie still goes to d
         self.m._write_status_file(sf, {"claude": holder})
         later = dict(holder, lastAttempt={"at": now + 20, "outcome": "cache", "error": None})
@@ -814,6 +815,30 @@ class TestAgy(Base):
         self.assertTrue(d["stale"])
         self.assertIn("3h", d["error"])
         self.assertEqual(d["plan"], "7 credits")
+
+
+
+class TestStatusTieKeepsFailure(Base):
+    def _merge(self, prev, d):
+        sf = os.path.join(self.tmp.name, "status.json")
+        with open(sf, "w") as f:
+            json.dump({"providers": {"claude": prev}}, f)
+        self.m._write_status_file(sf, {"claude": d})
+        return json.load(open(sf))["providers"]["claude"]
+
+    def test_tie_never_clears_a_recorded_failure(self):
+        t0 = int(time.time()) - 60
+        prev = {"available": True, "fetchedAt": t0, "stale": True, "error": "HTTP 429",
+                "lastAttempt": {"at": t0 + 30, "outcome": "error", "error": "HTTP 429"}}
+        busy = {"available": True, "fetchedAt": t0, "stale": True, "error": "busy",
+                "lastAttempt": {"at": t0 + 40, "outcome": "busy", "error": "busy"}}
+        self.assertEqual(self._merge(prev, busy)["error"], "HTTP 429")
+        cached = {"available": True, "fetchedAt": t0, "stale": False, "error": None,
+                  "lastAttempt": {"at": t0 + 50, "outcome": "cache", "error": None}}
+        self.assertEqual(self._merge(prev, cached)["error"], "HTTP 429")
+        ok = {"available": True, "fetchedAt": t0, "stale": False, "error": None,
+              "lastAttempt": {"at": t0 + 50, "outcome": "fetched", "error": None}}
+        self.assertIsNone(self._merge(prev, ok)["error"])
 
 
 class TestArgs(unittest.TestCase):

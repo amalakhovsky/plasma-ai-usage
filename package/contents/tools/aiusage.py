@@ -1279,9 +1279,13 @@ def _write_status_file(status_file, providers):
                         keep["error"] = d.get("error") or keep.get("error")
                         keep["stale"] = True
                 merged[name] = keep
-            elif prev_at == _fetched_at(d) and d_busy and not prev.get("error"):
-                # A lock-timeout waiter served the holder's cache: the holder's
-                # clean entry wins the tie.
+            elif prev_at == _fetched_at(d) and (d_busy or (
+                    (prev.get("error") or prev.get("stale")) and _attempt(d).get("outcome") != "fetched")
+                    or (_attempt_at(prev) is not None and _attempt_at(d) is not None
+                        and _attempt_at(d) < _attempt_at(prev))):
+                # Same data on both sides. A lock-timeout waiter never fetched; only a live
+                # successful fetch may clear a recorded failure; an older attempt never
+                # overrides a newer one.
                 merged[name] = prev
             else:
                 merged[name] = d
