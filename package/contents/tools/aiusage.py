@@ -103,7 +103,6 @@ OR_KEY_FILE = os.environ.get("OPENROUTER_KEY_FILE") or os.path.join(
 OR_FLOORS = [10.0, 3.0]
 OR_NOTIFY = True                 # --no-notify disables the desktop notification on crossing a floor
 
-EXPIRY_SKEW = 30                 # treat a token as expired this many seconds early
 HTTP_TIMEOUT = 15
 _SSL = ssl.create_default_context()
 
@@ -151,14 +150,21 @@ def _read_json_strict(path, retries=3):
             time.sleep(0.05)
 
 
-def _write_json_atomic(path, data):
-    """Owner-only (0600) atomic write, so a token refresh never leaves a
-    half-written creds file and never widens the file's permissions. Writes
-    through symlinks (to the real file) and uses an exclusive random temp."""
+def _write_json_atomic(path, data, keep_mode=False):
+    """Atomic write, owner-only (0600) by default so a token refresh never
+    leaves a half-written creds file and never widens its permissions. With
+    keep_mode an existing target keeps its current mode (a new file is 0600).
+    Writes through symlinks (to the real file) with an exclusive random temp."""
     real = os.path.realpath(path)
+    mode = 0o600
+    if keep_mode:
+        try:
+            mode = os.stat(real).st_mode & 0o7777
+        except OSError:
+            pass
     fd, tmp = tempfile.mkstemp(prefix=".tmp.", dir=os.path.dirname(real) or ".")
     try:
-        os.fchmod(fd, 0o600)
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
         os.replace(tmp, real)
@@ -289,7 +295,7 @@ CL_CREDS = lambda: _home_file(".claude", ".credentials.json")
 
 def _claude_expired(oauth):
     exp_ms = int(oauth.get("expiresAt") or 0)
-    return bool(exp_ms) and exp_ms / 1000 <= time.time() + EXPIRY_SKEW
+    return bool(exp_ms) and exp_ms / 1000 <= time.time()
 
 
 def _claude_adopt(oauth, disk):
@@ -304,13 +310,18 @@ def _claude_refresh(root):
     path = CL_CREDS()
     oauth = root["claudeAiOauth"]
     held = oauth.get("accessToken")
+    held_ref = oauth.get("refreshToken")
     # A live CLI may already have rotated the tokens: the disk copy is the truth.
     disk = ((_read_json(path) or {}).get("claudeAiOauth")) or {}
     if disk.get("accessToken"):
         _claude_adopt(oauth, disk)
-        if disk["accessToken"] != held and not _claude_expired(disk):
+        if ((disk["accessToken"] != held or disk.get("refreshToken") != held_ref)
+                and not _claude_expired(disk)):
             return oauth["accessToken"], False
+    if not _claude_expired(oauth):
+        return oauth["accessToken"], False  # only step in when nobody else has
     pre_tok = oauth.get("accessToken")
+    pre_ref = oauth.get("refreshToken")
     status, data = _request("POST", CL_TOKEN_URL, {}, {
         "grant_type": "refresh_token",
         "refresh_token": oauth["refreshToken"],
@@ -334,24 +345,19 @@ def _claude_refresh(root):
         oauth["refreshToken"] = data["refresh_token"]
     if data.get("expires_in"):
         oauth["expiresAt"] = int((time.time() + data["expires_in"]) * 1000)
-    # Merge only the token fields into a fresh copy of the file.
-    fresh = _read_json(path)
+    # Re-read immediately before writing; never fall back to an older snapshot.
+    fresh = _read_json_strict(path)
     if not isinstance(fresh, dict) or not isinstance(fresh.get("claudeAiOauth"), dict):
-        fresh = root
-    else:
-        cur = fresh["claudeAiOauth"]
-        # Someone rotated the token during our POST and theirs is at least as
-        # fresh: keep it, don't overwrite it with ours.
-        if (cur.get("accessToken") and cur["accessToken"] != pre_tok
-                and cur["accessToken"] != oauth["accessToken"]
-                and not _claude_expired(cur)
-                and int(cur.get("expiresAt") or 0) >= int(oauth.get("expiresAt") or 0)):
-            _claude_adopt(oauth, cur)
-            return oauth["accessToken"], True
+        raise RuntimeError("credentials file unreadable before write; not overwriting")
+    cur = fresh["claudeAiOauth"]
+    if cur.get("accessToken") != pre_tok or cur.get("refreshToken") != pre_ref:
+        # Someone else rotated the tokens during our POST: theirs win, no write.
+        _claude_adopt(oauth, cur)
+        return oauth["accessToken"], True
     for k in CL_TOKEN_FIELDS:
         if k in oauth:
-            fresh["claudeAiOauth"][k] = oauth[k]
-    _write_json_atomic(path, fresh)
+            cur[k] = oauth[k]
+    _write_json_atomic(path, fresh, keep_mode=True)
     return oauth["accessToken"], True
 
 
@@ -566,7 +572,7 @@ CX_TOKEN_FIELDS = ("access_token", "refresh_token", "id_token")
 
 def _codex_expired(tok):
     exp = _jwt_exp(tok)
-    return bool(exp) and exp <= time.time() + EXPIRY_SKEW
+    return bool(exp) and exp <= time.time()
 
 
 def _codex_adopt(tokens, disk):
@@ -579,12 +585,17 @@ def _codex_refresh(auth, path):
     """Return (access_token, posted); see _claude_refresh."""
     tokens = auth["tokens"]
     held = tokens.get("access_token")
+    held_ref = tokens.get("refresh_token")
     disk = ((_read_json(path) or {}).get("tokens")) or {}
     if disk.get("access_token"):
         _codex_adopt(tokens, disk)
-        if disk["access_token"] != held and not _codex_expired(disk["access_token"]):
+        if ((disk["access_token"] != held or disk.get("refresh_token") != held_ref)
+                and not _codex_expired(disk["access_token"])):
             return tokens["access_token"], False
+    if not _codex_expired(tokens.get("access_token")):
+        return tokens["access_token"], False  # only step in when nobody else has
     pre_tok = tokens.get("access_token")
+    pre_ref = tokens.get("refresh_token")
     status, data = _request("POST", CX_TOKEN_URL, {}, {
         "grant_type": "refresh_token",
         "refresh_token": tokens["refresh_token"],
@@ -610,22 +621,20 @@ def _codex_refresh(auth, path):
         tokens["id_token"] = data["id_token"]
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
     auth["last_refresh"] = stamp
-    fresh = _read_json(path)
+    # Re-read immediately before writing; never fall back to an older snapshot.
+    fresh = _read_json_strict(path)
     if not isinstance(fresh, dict) or not isinstance(fresh.get("tokens"), dict):
-        fresh = auth
-    else:
-        cur = fresh["tokens"]
-        cur_tok = cur.get("access_token")
-        if (cur_tok and cur_tok != pre_tok and cur_tok != tokens["access_token"]
-                and not _codex_expired(cur_tok)
-                and (_jwt_exp(cur_tok) or 0) >= (_jwt_exp(tokens["access_token"]) or 0)):
-            _codex_adopt(tokens, cur)
-            return tokens["access_token"], True
+        raise RuntimeError("credentials file unreadable before write; not overwriting")
+    cur = fresh["tokens"]
+    if cur.get("access_token") != pre_tok or cur.get("refresh_token") != pre_ref:
+        # Someone else rotated the tokens during our POST: theirs win, no write.
+        _codex_adopt(tokens, cur)
+        return tokens["access_token"], True
     for k in CX_TOKEN_FIELDS:
         if k in tokens:
-            fresh["tokens"][k] = tokens[k]
+            cur[k] = tokens[k]
     fresh["last_refresh"] = stamp
-    _write_json_atomic(path, fresh)
+    _write_json_atomic(path, fresh, keep_mode=True)
     return tokens["access_token"], True
 
 
@@ -973,8 +982,12 @@ def _load_state():
 
 
 def _persist_hold(name, value):
-    """Read-modify-write one provider's hold so concurrent runs don't clobber others."""
+    """Read-modify-write one provider's hold so concurrent runs don't clobber
+    others. Without the lock the write is skipped (the in-memory hold stands)."""
     fd = _lock_acquire(os.path.join(CACHE_DIR, "widget-state.lock"), 5)
+    if fd is None or fd < 0:
+        sys.stderr.write(f"aiusage: widget-state lock unavailable; hold for {name} not persisted\n")
+        return
     try:
         st = _load_state()
         st["holds"][name] = value
@@ -1033,18 +1046,21 @@ def provider(name, force, wstate, now, attempt=None):
     try:
         if fd is None:
             return _serve_busy(name, creds, attempt, time.time())
+        if fd < 0:  # cannot lock: never fetch unlocked, serve the cache
+            return _serve_busy(name, creds, attempt, time.time(),
+                               error="lock unavailable", outcome="error")
         _refresh_wstate(wstate)
         return _provider_locked(name, force, wstate, time.time(), attempt)
     finally:
         _lock_release(fd)
 
 
-def _serve_busy(name, creds, attempt, now):
+def _serve_busy(name, creds, attempt, now, error="busy", outcome="busy"):
     _, _, parse, _ = PROVIDERS[name]
     cache = _read_json(_cache_paths(name)[0])
-    attempt.update(at=now, outcome="busy", error="busy")
+    attempt.update(at=now, outcome=outcome, error=error)
     if isinstance(cache, dict) and cache.get("response") is not None:
-        out = {"available": True, "error": "busy", "stale": True,
+        out = {"available": True, "error": error, "stale": True,
                "fetchedAt": int(cache.get("fetchedAt") or 0), "source": cache.get("source") or "?",
                "windows": [], "spend": None, "tier": None, "plan": None}
         try:
@@ -1052,7 +1068,7 @@ def _serve_busy(name, creds, attempt, now):
         except Exception:
             pass
         return out
-    return {"available": True, "error": "busy", "stale": True, "fetchedAt": 0,
+    return {"available": True, "error": error, "stale": True, "fetchedAt": 0,
             "source": None, "windows": [], "spend": None, "tier": None, "plan": None}
 
 
@@ -1256,12 +1272,15 @@ def main():
         _openrouter_notify(out["openrouter"], wstate)
         if wstate.get("openrouterSeverity") != prev:
             fd = _lock_acquire(os.path.join(CACHE_DIR, "widget-state.lock"), 5)
-            try:
-                st = _load_state()
-                st["openrouterSeverity"] = wstate["openrouterSeverity"]
-                _write_cache(WIDGET_STATE, st)
-            finally:
-                _lock_release(fd)
+            if fd is None or fd < 0:
+                sys.stderr.write("aiusage: widget-state lock unavailable; severity not persisted\n")
+            else:
+                try:
+                    st = _load_state()
+                    st["openrouterSeverity"] = wstate["openrouterSeverity"]
+                    _write_cache(WIDGET_STATE, st)
+                finally:
+                    _lock_release(fd)
     json.dump(out, sys.stdout, indent=2 if args.pretty else None)
     sys.stdout.write("\n")
     sys.stdout.flush()

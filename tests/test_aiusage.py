@@ -133,6 +133,30 @@ class TestLocking(Base):
         self.assertEqual(self.calls["claude"], 0)
 
 
+class TestLockFailures(Base):
+    def test_lock_open_failure_never_fetches(self):
+        self.m._write_cache(self.m._cache_paths("claude")[0],
+                            {"fetchedAt": int(time.time()) - 5000, "source": "crew", "response": CLAUDE_RAW})
+        self.m._lock_acquire = lambda path, timeout=None: -1
+        att = {}
+        out = self.m.provider("claude", True, self.state(), time.time(), att)
+        self.assertEqual(self.calls["claude"], 0)
+        self.assertTrue(out["stale"])
+        self.assertEqual(out["error"], "lock unavailable")
+        self.assertTrue(out["windows"])
+        self.assertEqual(att["outcome"], "error")
+
+    def test_hold_write_skipped_on_lock_timeout(self):
+        fd = self.m._lock_acquire(os.path.join(self.m.CACHE_DIR, "widget-state.lock"))
+        real = self.m._lock_acquire
+        self.m._lock_acquire = lambda path, timeout=None: real(path, 0.2)
+        try:
+            self.m._persist_hold("claude", 900)
+        finally:
+            self.m._lock_release(fd)
+        self.assertFalse(os.path.exists(self.m.WIDGET_STATE))
+
+
 class TestStatusFile(Base):
     def test_status_file_shape(self):
         sf = os.path.join(self.tmp.name, "status.json")
@@ -242,6 +266,7 @@ class TestRefresh(unittest.TestCase):
             json.dump({"claudeAiOauth": {"accessToken": "old", "refreshToken": "r1",
                                          "expiresAt": now_ms - 1000, "scopes": ["a"]},
                        "mcpOAuth": {"k": 1}}, fh)
+        os.chmod(self.path, 0o600)
         self.m._request = self.fake_request
         self.m.claude_fetch_raw(root)
         with open(self.path) as fh:
@@ -319,6 +344,65 @@ class TestRefresh(unittest.TestCase):
         self.assertEqual(saved["tokens"]["access_token"], "NEWTOK")
         self.assertEqual(saved["tokens"]["account_id"], "A")
         self.assertEqual(saved["OPENAI_API_KEY"], "k")
+
+    def test_no_refresh_while_not_yet_expired(self):
+        now_ms = int(time.time() * 1000)
+        self.write_claude("live", "r1", now_ms + 10_000)  # near expiry only
+        self.m._request = self.fake_request
+        root = {"claudeAiOauth": {"accessToken": "live", "refreshToken": "r1",
+                                  "expiresAt": now_ms + 10_000}}
+        self.m.claude_fetch_raw(root)
+        self.assertEqual(self.token_posts(), [])
+        self.assertEqual(self.requests[-1][2]["Authorization"], "Bearer live")
+        path = os.path.join(self.tmp.name, "auth.json")
+        tok = jwt(int(time.time()) + 10)
+        auth = {"tokens": {"access_token": tok, "refresh_token": "r1"}}
+        self.m.codex_fetch_raw((auth, path))
+        self.assertEqual(self.token_posts(), [])
+
+    def test_refresh_aborts_on_unreadable_fresh_copy(self):
+        now_ms = int(time.time() * 1000)
+        self.write_claude("old", "r1", now_ms - 1000)
+        def corrupt():
+            with open(self.path, "w") as fh:
+                fh.write('{"claudeAiOauth": {"acc')
+        self.hook = corrupt
+        self.m._request = self.fake_request
+        with self.assertRaises(Exception):
+            self.m.claude_fetch_raw(self.expired_root())
+        with open(self.path) as fh:
+            self.assertEqual(fh.read(), '{"claudeAiOauth": {"acc')  # untouched
+        # codex: file vanishes during the POST
+        path = os.path.join(self.tmp.name, "auth.json")
+        tok_old = jwt(int(time.time()) - 10)
+        with open(path, "w") as fh:
+            json.dump({"tokens": {"access_token": tok_old, "refresh_token": "r1"}}, fh)
+        self.hook = lambda: os.unlink(path)
+        auth = {"tokens": {"access_token": tok_old, "refresh_token": "r1"}}
+        with self.assertRaises(Exception):
+            self.m.codex_fetch_raw((auth, path))
+        self.assertFalse(os.path.exists(path))
+
+    def test_refresh_adopts_concurrently_changed_file_without_writing(self):
+        now_ms = int(time.time() * 1000)
+        self.write_claude("old", "r1", now_ms - 1000)
+        # refresh token changed but the access token is the same as ours
+        self.hook = lambda: self.write_claude("old", "r2", now_ms - 1000, keep=1)
+        self.m._request = self.fake_request
+        self.m.claude_fetch_raw(self.expired_root())
+        saved = self.read_claude()
+        self.assertEqual((saved["accessToken"], saved["refreshToken"]), ("old", "r2"))
+        with open(self.path) as fh:
+            self.assertEqual(json.load(fh)["keep"], 1)
+
+    def test_refresh_preserves_file_mode(self):
+        now_ms = int(time.time() * 1000)
+        self.write_claude("old", "r1", now_ms - 1000)
+        os.chmod(self.path, 0o640)
+        self.m._request = self.fake_request
+        self.m.claude_fetch_raw(self.expired_root())
+        self.assertEqual(self.read_claude()["accessToken"], "NEWTOK")
+        self.assertEqual(oct(os.stat(self.path).st_mode & 0o777), "0o640")
 
     def test_token_status_classification(self):
         now_ms = int(time.time() * 1000)
