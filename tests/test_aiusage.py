@@ -699,6 +699,64 @@ class TestCacheAndStatus(Base):
         self.assertEqual(c["lastAttempt"], failed["lastAttempt"])
         self.assertEqual((c["error"], c["stale"]), ("HTTP 500", True))
 
+    def test_status_merge_lagging_writer_does_not_stain_fresh_data(self):
+        # Writer A's attempt failed at now-50, but B fetched successfully at
+        # now-10 and wrote first; A's late write must not mark B's data stale.
+        sf = os.path.join(self.tmp.name, "s", "status.json")
+        now = int(time.time())
+        fresh = {"available": True, "error": None, "stale": False, "fetchedAt": now - 10,
+                 "windows": [{"percent": 30}],
+                 "lastAttempt": {"at": now - 10, "outcome": "fetched", "error": None}}
+        lagging = {"available": True, "error": "HTTP 500", "stale": True, "fetchedAt": now - 900,
+                   "windows": [{"percent": 10}],
+                   "lastAttempt": {"at": now - 50, "outcome": "error", "error": "HTTP 500"}}
+        self.m._write_status_file(sf, {"claude": fresh})
+        self.m._write_status_file(sf, {"claude": lagging})
+        with open(sf) as fh:
+            c = json.load(fh)["providers"]["claude"]
+        self.assertEqual(c, fresh)
+
+    def test_status_merge_newer_failure_still_overlays_and_busy_never_does(self):
+        sf = os.path.join(self.tmp.name, "s", "status.json")
+        now = int(time.time())
+        fresh = {"available": True, "error": None, "stale": False, "fetchedAt": now - 100,
+                 "windows": [{"percent": 30}],
+                 "lastAttempt": {"at": now - 100, "outcome": "fetched", "error": None}}
+        busy_old = {"available": True, "error": "busy", "stale": True, "fetchedAt": now - 900,
+                    "windows": [], "lastAttempt": {"at": now, "outcome": "busy", "error": "busy"}}
+        self.m._write_status_file(sf, {"claude": fresh})
+        self.m._write_status_file(sf, {"claude": busy_old})
+        with open(sf) as fh:
+            self.assertEqual(json.load(fh)["providers"]["claude"], fresh)
+
+    def test_status_merge_busy_tie_keeps_holder_entry(self):
+        # Lock-timeout waiter (_serve_busy) reports the holder's fetchedAt with
+        # error/stale "busy"; the holder's clean entry must survive the tie.
+        sf = os.path.join(self.tmp.name, "s", "status.json")
+        now = int(time.time())
+        holder = {"available": True, "error": None, "stale": False, "fetchedAt": now,
+                  "windows": [{"percent": 30}],
+                  "lastAttempt": {"at": now, "outcome": "fetched", "error": None}}
+        waiter = {"available": True, "error": "busy", "stale": True, "fetchedAt": now,
+                  "windows": [{"percent": 30}],
+                  "lastAttempt": {"at": now + 10, "outcome": "busy", "error": "busy"}}
+        self.m._write_status_file(sf, {"claude": holder})
+        self.m._write_status_file(sf, {"claude": waiter})
+        with open(sf) as fh:
+            self.assertEqual(json.load(fh)["providers"]["claude"], holder)
+        # but a tie where prev already carries an error is still taken from d
+        errored = dict(holder, error="HTTP 500", stale=True)
+        self.m._write_status_file(sf, {"claude": errored})
+        self.m._write_status_file(sf, {"claude": waiter})
+        with open(sf) as fh:
+            self.assertEqual(json.load(fh)["providers"]["claude"], waiter)
+        # and a non-busy tie still goes to d
+        self.m._write_status_file(sf, {"claude": holder})
+        later = dict(holder, lastAttempt={"at": now + 20, "outcome": "cache", "error": None})
+        self.m._write_status_file(sf, {"claude": later})
+        with open(sf) as fh:
+            self.assertEqual(json.load(fh)["providers"]["claude"], later)
+
     def test_status_write_unlockable_raises(self):
         sf = os.path.join(self.tmp.name, "s", "status.json")
         self.m._lock_acquire = lambda path, timeout=None: -1

@@ -1224,6 +1224,22 @@ def _fetched_at(d):
         return 0.0
 
 
+def _attempt(d):
+    a = d.get("lastAttempt") if isinstance(d, dict) else None
+    return a if isinstance(a, dict) else {}
+
+
+def _attempt_at(d):
+    """lastAttempt.at as a float, or None when absent/invalid."""
+    v = _attempt(d).get("at")
+    if isinstance(v, bool):
+        return None
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 STATUS_FUTURE_SKEW = 60  # a previous entry dated further ahead than this is never kept
 
 
@@ -1245,17 +1261,28 @@ def _write_status_file(status_file, providers):
         for name, d in providers.items():
             prev = old.get(name) if isinstance(old, dict) else None
             prev_at = _fetched_at(prev)
-            if (isinstance(prev, dict) and d.get("available") is not False
-                    and prev_at > _fetched_at(d)
+            d_busy = _attempt(d).get("outcome") == "busy"
+            if not (isinstance(prev, dict) and d.get("available") is not False
                     and prev_at <= now + STATUS_FUTURE_SKEW):  # future-dated: clock stepped back
-                # Keep the newer windows, but say what this run saw.
+                merged[name] = d
+            elif prev_at > _fetched_at(d):
+                # Keep the newer windows; say what this run saw only if its
+                # attempt is not older than what prev already reflects (a
+                # lagging writer's earlier failure must not stain fresh data)
+                # and it was a real attempt, not a lock-timeout "busy" serve.
                 keep = dict(prev)
-                if "lastAttempt" in d:
-                    keep["lastAttempt"] = d["lastAttempt"]
-                if d.get("error") or d.get("stale"):
-                    keep["error"] = d.get("error") or keep.get("error")
-                    keep["stale"] = True
+                if not d_busy and _attempt_at(d) is not None and _attempt_at(d) >= max(
+                        prev_at, _attempt_at(prev) or 0):
+                    if "lastAttempt" in d:
+                        keep["lastAttempt"] = d["lastAttempt"]
+                    if d.get("error") or d.get("stale"):
+                        keep["error"] = d.get("error") or keep.get("error")
+                        keep["stale"] = True
                 merged[name] = keep
+            elif prev_at == _fetched_at(d) and d_busy and not prev.get("error"):
+                # A lock-timeout waiter served the holder's cache: the holder's
+                # clean entry wins the tie.
+                merged[name] = prev
             else:
                 merged[name] = d
         _write_json_atomic(real, {"generatedAt": int(time.time()), "providers": merged})
